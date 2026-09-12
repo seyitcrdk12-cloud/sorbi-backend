@@ -8,6 +8,8 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
+const FREE_QUESTION_LIMIT = 3;
+
 const uploadsDir = path.join(__dirname, "uploads");
 const answersDir = path.join(__dirname, "answers");
 const questionsFile = path.join(__dirname, "questions.json");
@@ -106,18 +108,13 @@ function writeQuestions(questions) {
   );
 }
 
-// Windows tam yolunu temizler.
-// Örn:
-// C:/Users/asus/yds_backend/uploads/abc
-// ->
-// uploads/abc
-
 function cleanUploadPath(filePath) {
   if (!filePath) {
     return "";
   }
 
-  const normalized = filePath.replace(/\\/g, "/");
+  const normalized =
+    filePath.replace(/\\/g, "/");
 
   const uploadsIndex =
     normalized.lastIndexOf("/uploads/");
@@ -140,7 +137,8 @@ function cleanAnswerPath(filePath) {
     return "";
   }
 
-  const normalized = filePath.replace(/\\/g, "/");
+  const normalized =
+    filePath.replace(/\\/g, "/");
 
   const answersIndex =
     normalized.lastIndexOf("/answers/");
@@ -171,6 +169,43 @@ function fileToUrl(filePath, type) {
   return `/${cleanPath}`;
 }
 
+function getUserQuestions(
+  questions,
+  userId
+) {
+  return questions.filter(
+    (q) => q.userId === userId
+  );
+}
+
+function getUsedFreeQuestions(
+  questions,
+  userId
+) {
+  return getUserQuestions(
+    questions,
+    userId
+  ).length;
+}
+
+function getRemainingFreeQuestions(
+  questions,
+  userId
+) {
+  const used =
+    getUsedFreeQuestions(
+      questions,
+      userId
+    );
+
+  const remaining =
+    FREE_QUESTION_LIMIT - used;
+
+  return remaining > 0
+    ? remaining
+    : 0;
+}
+
 // ----------------------------------------------------
 // ANA SAYFA
 // ----------------------------------------------------
@@ -178,6 +213,61 @@ function fileToUrl(filePath, type) {
 app.get("/", (req, res) => {
   res.send("SorBi server çalışıyor");
 });
+
+// ----------------------------------------------------
+// KULLANICININ HAKLARI
+// ----------------------------------------------------
+
+app.get(
+  "/rights/:userId",
+  (req, res) => {
+    try {
+      const userId =
+        req.params.userId;
+
+      const questions =
+        readQuestions();
+
+      const usedFreeQuestions =
+        getUsedFreeQuestions(
+          questions,
+          userId
+        );
+
+      const remainingFreeQuestions =
+        getRemainingFreeQuestions(
+          questions,
+          userId
+        );
+
+      return res.json({
+        freeQuestionLimit:
+          FREE_QUESTION_LIMIT,
+
+        usedFreeQuestions:
+          usedFreeQuestions,
+
+        remainingFreeQuestions:
+          remainingFreeQuestions,
+
+        freeQuestionsFinished:
+          remainingFreeQuestions <= 0,
+      });
+    } catch (error) {
+      console.error(
+        "Hak bilgisi hatası:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            "Hak bilgisi alınamadı.",
+        });
+    }
+  }
+);
 
 // ----------------------------------------------------
 // YENİ SORU GÖNDER
@@ -201,6 +291,12 @@ app.post(
         req.body.userId?.toString();
 
       if (!userId) {
+        if (req.file?.path) {
+          try {
+            fs.unlinkSync(req.file.path);
+          } catch (_) {}
+        }
+
         return res
           .status(400)
           .json({
@@ -212,28 +308,60 @@ app.post(
       const questions =
         readQuestions();
 
+      const remainingBefore =
+        getRemainingFreeQuestions(
+          questions,
+          userId
+        );
+
+      if (remainingBefore <= 0) {
+        if (req.file?.path) {
+          try {
+            fs.unlinkSync(req.file.path);
+          } catch (_) {}
+        }
+
+        return res
+          .status(403)
+          .json({
+            error:
+              "Ücretsiz soru hakkın bitti.",
+
+            code:
+              "FREE_LIMIT_REACHED",
+
+            freeQuestionLimit:
+              FREE_QUESTION_LIMIT,
+
+            remainingFreeQuestions:
+              0,
+          });
+      }
+
       const newQuestion = {
         id: Date.now(),
 
         userId: userId,
 
-        // Burada artık tam Windows yolunu değil
-        // sadece uploads/... kaydediyoruz.
         file:
           cleanUploadPath(
             req.file.path
           ),
 
-        status: "bekliyor",
+        status:
+          "bekliyor",
 
-        answer: "",
+        answer:
+          "",
 
-        answerFile: "",
+        answerFile:
+          "",
 
         createdAt:
           new Date().toISOString(),
 
-        answeredAt: null,
+        answeredAt:
+          null,
       };
 
       questions.push(
@@ -244,19 +372,33 @@ app.post(
         questions
       );
 
+      const remainingAfter =
+        getRemainingFreeQuestions(
+          questions,
+          userId
+        );
+
       console.log(
         "Yeni soru geldi:",
         newQuestion.id,
         "Kullanıcı:",
         userId,
-        "Dosya:",
-        newQuestion.file
+        "Kalan ücretsiz hak:",
+        remainingAfter
       );
 
       return res.json({
         result:
           "Sorun hocana ulaştı.",
-        id: newQuestion.id,
+
+        id:
+          newQuestion.id,
+
+        freeQuestionLimit:
+          FREE_QUESTION_LIMIT,
+
+        remainingFreeQuestions:
+          remainingAfter,
       });
     } catch (error) {
       console.error(
@@ -418,35 +560,25 @@ app.get(
 
     let html = `
 <!DOCTYPE html>
-
 <html lang="tr">
-
 <head>
-
 <meta charset="UTF-8">
-
 <meta
-name="viewport"
-content="width=device-width, initial-scale=1.0">
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
 
 <title>SorBi Hoca Paneli</title>
 
 <style>
-
 * {
   box-sizing: border-box;
 }
 
 body {
-  font-family:
-    Arial,
-    sans-serif;
-
-  background:
-    #f5f4fa;
-
+  font-family: Arial, sans-serif;
+  background: #f5f4fa;
   margin: 0;
-
   padding: 25px;
 }
 
@@ -462,16 +594,11 @@ h1 {
 
 .card {
   background: white;
-
   padding: 22px;
-
   margin-bottom: 22px;
-
   border-radius: 18px;
-
   box-shadow:
-    0 3px 14px
-    rgba(0,0,0,0.08);
+    0 3px 14px rgba(0,0,0,0.08);
 }
 
 .top-row {
@@ -506,60 +633,26 @@ h1 {
   font-weight: bold;
 }
 
-.question-image {
-  display: block;
-
-  max-width: 500px;
-
-  width: 100%;
-
-  max-height: 600px;
-
-  object-fit: contain;
-
-  border-radius: 12px;
-
-  margin-top: 12px;
-
-  border:
-    1px solid #eee;
-}
-
+.question-image,
 .answer-image {
   display: block;
-
   max-width: 500px;
-
   width: 100%;
-
   max-height: 600px;
-
   object-fit: contain;
-
   border-radius: 12px;
-
-  margin-top: 10px;
-
-  border:
-    1px solid #eee;
+  margin-top: 12px;
+  border: 1px solid #eee;
 }
 
 textarea {
   width: 100%;
-
   min-height: 110px;
-
   margin-top: 15px;
-
   padding: 12px;
-
   border-radius: 10px;
-
-  border:
-    1px solid #ccc;
-
+  border: 1px solid #ccc;
   font-size: 16px;
-
   resize: vertical;
 }
 
@@ -569,46 +662,29 @@ input[type="file"] {
 
 button {
   margin-top: 15px;
-
-  padding:
-    12px 20px;
-
-  background:
-    #7057e8;
-
+  padding: 12px 20px;
+  background: #7057e8;
   color: white;
-
   border: none;
-
   border-radius: 10px;
-
   cursor: pointer;
-
   font-size: 15px;
 }
 
 button:hover {
-  background:
-    #5f45cf;
+  background: #5f45cf;
 }
 
 .existing-answer {
-  background:
-    #f2efff;
-
+  background: #f2efff;
   padding: 14px;
-
   border-radius: 10px;
-
   margin-top: 18px;
 }
-
 </style>
-
 </head>
 
 <body>
-
 <div class="container">
 
 <h1>
@@ -628,9 +704,6 @@ Henüz soru yok.
 
     questions.forEach(
       (q) => {
-
-        // Eski questions.json kayıtlarında
-        // tam Windows yolu varsa onu da temizler.
         const questionImage =
           fileToUrl(
             q.file,
@@ -652,7 +725,6 @@ Henüz soru yok.
             : "waiting";
 
         html += `
-
 <div class="card">
 
 <div class="top-row">
@@ -672,8 +744,7 @@ ${q.userId || "Eski soru"}
 
 </div>
 
-<p
-class="status ${statusClass}">
+<p class="status ${statusClass}">
 ${q.status}
 </p>
 
@@ -686,16 +757,19 @@ Gönderilen soru
 <img
 class="question-image"
 src="${questionImage}"
-alt="Soru fotoğrafı">
+alt="Soru fotoğrafı"
+>
 
 <form
 action="/panel-answer/${q.id}"
 method="POST"
-enctype="multipart/form-data">
+enctype="multipart/form-data"
+>
 
 <textarea
 name="answer"
-placeholder="Cevabı buraya yaz...">${q.answer || ""}</textarea>
+placeholder="Cevabı buraya yaz..."
+>${q.answer || ""}</textarea>
 
 <br><br>
 
@@ -710,23 +784,22 @@ placeholder="Cevabı buraya yaz...">${q.answer || ""}</textarea>
 <input
 type="file"
 name="answerFile"
-accept="image/*">
+accept="image/*"
+>
 
 <br>
 
 <button
-type="submit">
+type="submit"
+>
 Cevabı Kaydet
 </button>
 
 </form>
 `;
 
-        if (
-          q.answer
-        ) {
+        if (q.answer) {
           html += `
-
 <div class="existing-answer">
 
 <strong>
@@ -741,11 +814,8 @@ ${q.answer}
 `;
         }
 
-        if (
-          answerImage
-        ) {
+        if (answerImage) {
           html += `
-
 <p class="image-title">
 Mevcut çözüm fotoğrafı
 </p>
@@ -753,23 +823,20 @@ Mevcut çözüm fotoğrafı
 <img
 class="answer-image"
 src="${answerImage}"
-alt="Çözüm fotoğrafı">
+alt="Çözüm fotoğrafı"
+>
 `;
         }
 
         html += `
-
 </div>
 `;
       }
     );
 
     html += `
-
 </div>
-
 </body>
-
 </html>
 `;
 
