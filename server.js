@@ -9,13 +9,15 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const FREE_QUESTION_LIMIT = 3;
+const PACKAGE_QUESTION_COUNT = 15;
 
 const uploadsDir = path.join(__dirname, "uploads");
 const answersDir = path.join(__dirname, "answers");
 const questionsFile = path.join(__dirname, "questions.json");
+const usersFile = path.join(__dirname, "users.json");
 
 // ----------------------------------------------------
-// KLASÖRLER
+// DOSYA VE KLASÖRLER
 // ----------------------------------------------------
 
 if (!fs.existsSync(uploadsDir)) {
@@ -30,6 +32,14 @@ if (!fs.existsSync(questionsFile)) {
   fs.writeFileSync(
     questionsFile,
     JSON.stringify([], null, 2),
+    "utf8"
+  );
+}
+
+if (!fs.existsSync(usersFile)) {
+  fs.writeFileSync(
+    usersFile,
+    JSON.stringify({}, null, 2),
     "utf8"
   );
 }
@@ -71,7 +81,7 @@ app.use(
 );
 
 // ----------------------------------------------------
-// YARDIMCI FONKSİYONLAR
+// QUESTIONS
 // ----------------------------------------------------
 
 function readQuestions() {
@@ -108,6 +118,110 @@ function writeQuestions(questions) {
   );
 }
 
+// ----------------------------------------------------
+// USERS / PAKET HAKLARI
+// ----------------------------------------------------
+
+function readUsers() {
+  try {
+    const data = fs.readFileSync(
+      usersFile,
+      "utf8"
+    );
+
+    if (!data.trim()) {
+      return {};
+    }
+
+    return JSON.parse(data);
+  } catch (error) {
+    console.error(
+      "users.json okuma hatası:",
+      error
+    );
+
+    return {};
+  }
+}
+
+function writeUsers(users) {
+  fs.writeFileSync(
+    usersFile,
+    JSON.stringify(
+      users,
+      null,
+      2
+    ),
+    "utf8"
+  );
+}
+
+function getPaidCredits(userId) {
+  const users = readUsers();
+
+  if (!users[userId]) {
+    return 0;
+  }
+
+  return Number(
+    users[userId].paidCredits || 0
+  );
+}
+
+function addPaidCredits(
+  userId,
+  amount
+) {
+  const users = readUsers();
+
+  if (!users[userId]) {
+    users[userId] = {
+      paidCredits: 0,
+    };
+  }
+
+  users[userId].paidCredits =
+    Number(
+      users[userId].paidCredits || 0
+    ) + amount;
+
+  users[userId].updatedAt =
+    new Date().toISOString();
+
+  writeUsers(users);
+
+  return users[userId].paidCredits;
+}
+
+function usePaidCredit(userId) {
+  const users = readUsers();
+
+  if (
+    !users[userId] ||
+    Number(
+      users[userId].paidCredits || 0
+    ) <= 0
+  ) {
+    return false;
+  }
+
+  users[userId].paidCredits =
+    Number(
+      users[userId].paidCredits
+    ) - 1;
+
+  users[userId].updatedAt =
+    new Date().toISOString();
+
+  writeUsers(users);
+
+  return true;
+}
+
+// ----------------------------------------------------
+// YARDIMCI FONKSİYONLAR
+// ----------------------------------------------------
+
 function cleanUploadPath(filePath) {
   if (!filePath) {
     return "";
@@ -125,7 +239,9 @@ function cleanUploadPath(filePath) {
     );
   }
 
-  if (normalized.startsWith("uploads/")) {
+  if (
+    normalized.startsWith("uploads/")
+  ) {
     return normalized;
   }
 
@@ -149,14 +265,19 @@ function cleanAnswerPath(filePath) {
     );
   }
 
-  if (normalized.startsWith("answers/")) {
+  if (
+    normalized.startsWith("answers/")
+  ) {
     return normalized;
   }
 
   return `answers/${path.basename(normalized)}`;
 }
 
-function fileToUrl(filePath, type) {
+function fileToUrl(
+  filePath,
+  type
+) {
   if (!filePath) {
     return "";
   }
@@ -178,22 +299,28 @@ function getUserQuestions(
   );
 }
 
-function getUsedFreeQuestions(
+function getFreeUsed(
   questions,
   userId
 ) {
-  return getUserQuestions(
-    questions,
-    userId
-  ).length;
+  const userQuestions =
+    getUserQuestions(
+      questions,
+      userId
+    );
+
+  return Math.min(
+    userQuestions.length,
+    FREE_QUESTION_LIMIT
+  );
 }
 
-function getRemainingFreeQuestions(
+function getFreeRemaining(
   questions,
   userId
 ) {
   const used =
-    getUsedFreeQuestions(
+    getFreeUsed(
       questions,
       userId
     );
@@ -206,16 +333,51 @@ function getRemainingFreeQuestions(
     : 0;
 }
 
+function getRightsInfo(
+  questions,
+  userId
+) {
+  const freeRemaining =
+    getFreeRemaining(
+      questions,
+      userId
+    );
+
+  const paidRemaining =
+    getPaidCredits(userId);
+
+  return {
+    freeQuestionLimit:
+      FREE_QUESTION_LIMIT,
+
+    freeRemaining:
+      freeRemaining,
+
+    paidRemaining:
+      paidRemaining,
+
+    totalRemaining:
+      freeRemaining +
+      paidRemaining,
+
+    needsPackage:
+      freeRemaining <= 0 &&
+      paidRemaining <= 0,
+  };
+}
+
 // ----------------------------------------------------
 // ANA SAYFA
 // ----------------------------------------------------
 
 app.get("/", (req, res) => {
-  res.send("SorBi server çalışıyor");
+  res.send(
+    "SorBi server çalışıyor"
+  );
 });
 
 // ----------------------------------------------------
-// KULLANICININ HAKLARI
+// KULLANICI HAKLARI
 // ----------------------------------------------------
 
 app.get(
@@ -228,31 +390,12 @@ app.get(
       const questions =
         readQuestions();
 
-      const usedFreeQuestions =
-        getUsedFreeQuestions(
+      return res.json(
+        getRightsInfo(
           questions,
           userId
-        );
-
-      const remainingFreeQuestions =
-        getRemainingFreeQuestions(
-          questions,
-          userId
-        );
-
-      return res.json({
-        freeQuestionLimit:
-          FREE_QUESTION_LIMIT,
-
-        usedFreeQuestions:
-          usedFreeQuestions,
-
-        remainingFreeQuestions:
-          remainingFreeQuestions,
-
-        freeQuestionsFinished:
-          remainingFreeQuestions <= 0,
-      });
+        )
+      );
     } catch (error) {
       console.error(
         "Hak bilgisi hatası:",
@@ -270,7 +413,49 @@ app.get(
 );
 
 // ----------------------------------------------------
-// YENİ SORU GÖNDER
+// TEST İÇİN 15 SORU HAKKI EKLE
+// ----------------------------------------------------
+
+app.post(
+  "/admin/add-package/:userId",
+  (req, res) => {
+    try {
+      const userId =
+        req.params.userId;
+
+      const newBalance =
+        addPaidCredits(
+          userId,
+          PACKAGE_QUESTION_COUNT
+        );
+
+      console.log(
+        "Paket eklendi:",
+        userId,
+        "Yeni bakiye:",
+        newBalance
+      );
+
+      return res.redirect(
+        "/panel"
+      );
+    } catch (error) {
+      console.error(
+        "Paket ekleme hatası:",
+        error
+      );
+
+      return res
+        .status(500)
+        .send(
+          "Paket eklenemedi"
+        );
+    }
+  }
+);
+
+// ----------------------------------------------------
+// YENİ SORU
 // ----------------------------------------------------
 
 app.post(
@@ -288,14 +473,15 @@ app.post(
       }
 
       const userId =
-        req.body.userId?.toString();
+        req.body.userId
+          ?.toString();
 
       if (!userId) {
-        if (req.file?.path) {
-          try {
-            fs.unlinkSync(req.file.path);
-          } catch (_) {}
-        }
+        try {
+          fs.unlinkSync(
+            req.file.path
+          );
+        } catch (_) {}
 
         return res
           .status(400)
@@ -308,45 +494,89 @@ app.post(
       const questions =
         readQuestions();
 
-      const remainingBefore =
-        getRemainingFreeQuestions(
+      const freeRemaining =
+        getFreeRemaining(
           questions,
           userId
         );
 
-      if (remainingBefore <= 0) {
-        if (req.file?.path) {
+      const paidRemaining =
+        getPaidCredits(
+          userId
+        );
+
+      let creditType = "";
+
+      // Önce ücretsiz hak kullanılır.
+      if (freeRemaining > 0) {
+        creditType = "free";
+      } else if (
+        paidRemaining > 0
+      ) {
+        const used =
+          usePaidCredit(
+            userId
+          );
+
+        if (!used) {
           try {
-            fs.unlinkSync(req.file.path);
+            fs.unlinkSync(
+              req.file.path
+            );
           } catch (_) {}
+
+          return res
+            .status(403)
+            .json({
+              error:
+                "Soru hakkın bulunmuyor.",
+              code:
+                "NO_CREDITS",
+            });
         }
+
+        creditType = "paid";
+      } else {
+        try {
+          fs.unlinkSync(
+            req.file.path
+          );
+        } catch (_) {}
 
         return res
           .status(403)
           .json({
             error:
-              "Ücretsiz soru hakkın bitti.",
+              "Ücretsiz soru hakkın bitti. Yeni paket satın almalısın.",
 
             code:
-              "FREE_LIMIT_REACHED",
+              "PACKAGE_REQUIRED",
 
-            freeQuestionLimit:
-              FREE_QUESTION_LIMIT,
+            freeRemaining:
+              0,
 
-            remainingFreeQuestions:
+            paidRemaining:
+              0,
+
+            totalRemaining:
               0,
           });
       }
 
       const newQuestion = {
-        id: Date.now(),
+        id:
+          Date.now(),
 
-        userId: userId,
+        userId:
+          userId,
 
         file:
           cleanUploadPath(
             req.file.path
           ),
+
+        creditType:
+          creditType,
 
         status:
           "bekliyor",
@@ -372,19 +602,21 @@ app.post(
         questions
       );
 
-      const remainingAfter =
-        getRemainingFreeQuestions(
+      const rights =
+        getRightsInfo(
           questions,
           userId
         );
 
       console.log(
-        "Yeni soru geldi:",
+        "Yeni soru:",
         newQuestion.id,
         "Kullanıcı:",
         userId,
-        "Kalan ücretsiz hak:",
-        remainingAfter
+        "Hak tipi:",
+        creditType,
+        "Kalan toplam:",
+        rights.totalRemaining
       );
 
       return res.json({
@@ -394,11 +626,10 @@ app.post(
         id:
           newQuestion.id,
 
-        freeQuestionLimit:
-          FREE_QUESTION_LIMIT,
+        creditType:
+          creditType,
 
-        remainingFreeQuestions:
-          remainingAfter,
+        ...rights,
       });
     } catch (error) {
       console.error(
@@ -417,7 +648,7 @@ app.post(
 );
 
 // ----------------------------------------------------
-// BELİRLİ KULLANICININ SORULARI
+// KULLANICININ SORULARI
 // ----------------------------------------------------
 
 app.get(
@@ -469,7 +700,7 @@ app.get(
 );
 
 // ----------------------------------------------------
-// HOCA CEVAP KAYDET
+// HOCA CEVABI
 // ----------------------------------------------------
 
 app.post(
@@ -561,16 +792,22 @@ app.get(
     let html = `
 <!DOCTYPE html>
 <html lang="tr">
+
 <head>
+
 <meta charset="UTF-8">
+
 <meta
-  name="viewport"
-  content="width=device-width, initial-scale=1.0"
+name="viewport"
+content="width=device-width, initial-scale=1.0"
 >
 
-<title>SorBi Hoca Paneli</title>
+<title>
+SorBi Hoca Paneli
+</title>
 
 <style>
+
 * {
   box-sizing: border-box;
 }
@@ -589,7 +826,6 @@ body {
 
 h1 {
   color: #6547d8;
-  margin-bottom: 25px;
 }
 
 .card {
@@ -598,22 +834,27 @@ h1 {
   margin-bottom: 22px;
   border-radius: 18px;
   box-shadow:
-    0 3px 14px rgba(0,0,0,0.08);
+  0 3px 14px
+  rgba(0,0,0,0.08);
 }
 
 .top-row {
   display: flex;
-  justify-content: space-between;
+  justify-content:
+  space-between;
   gap: 15px;
   flex-wrap: wrap;
 }
 
-.question-id {
-  margin: 0;
-}
-
 .user {
   color: #555;
+}
+
+.rights {
+  background: #eeeafe;
+  padding: 12px;
+  border-radius: 10px;
+  margin-top: 10px;
 }
 
 .status {
@@ -626,11 +867,6 @@ h1 {
 
 .status.done {
   color: #159957;
-}
-
-.image-title {
-  margin-top: 18px;
-  font-weight: bold;
 }
 
 .question-image,
@@ -653,11 +889,6 @@ textarea {
   border-radius: 10px;
   border: 1px solid #ccc;
   font-size: 16px;
-  resize: vertical;
-}
-
-input[type="file"] {
-  margin-top: 8px;
 }
 
 button {
@@ -668,11 +899,10 @@ button {
   border: none;
   border-radius: 10px;
   cursor: pointer;
-  font-size: 15px;
 }
 
-button:hover {
-  background: #5f45cf;
+.package-button {
+  background: #19172a;
 }
 
 .existing-answer {
@@ -681,10 +911,13 @@ button:hover {
   border-radius: 10px;
   margin-top: 18px;
 }
+
 </style>
+
 </head>
 
 <body>
+
 <div class="container">
 
 <h1>
@@ -724,23 +957,67 @@ Henüz soru yok.
             ? "done"
             : "waiting";
 
+        const userId =
+          q.userId || "";
+
+        const paidCredits =
+          userId
+            ? getPaidCredits(
+                userId
+              )
+            : 0;
+
         html += `
+
 <div class="card">
 
 <div class="top-row">
 
 <div>
 
-<h2 class="question-id">
-Soru ID: ${q.id}
+<h2>
+Soru ID:
+${q.id}
 </h2>
 
 <p class="user">
 Kullanıcı:
 <strong>
-${q.userId || "Eski soru"}
+${userId || "Eski soru"}
 </strong>
 </p>
+
+`;
+
+        if (userId) {
+          html += `
+
+<div class="rights">
+
+<strong>
+Paket soru hakkı:
+${paidCredits}
+</strong>
+
+<form
+action="/admin/add-package/${userId}"
+method="POST"
+>
+
+<button
+class="package-button"
+type="submit"
+>
++15 Soru Hakkı Ver
+</button>
+
+</form>
+
+</div>
+`;
+        }
+
+        html += `
 
 </div>
 
@@ -750,8 +1027,10 @@ ${q.status}
 
 </div>
 
-<p class="image-title">
+<p>
+<strong>
 Gönderilen soru
+</strong>
 </p>
 
 <img
@@ -800,6 +1079,7 @@ Cevabı Kaydet
 
         if (q.answer) {
           html += `
+
 <div class="existing-answer">
 
 <strong>
@@ -816,8 +1096,11 @@ ${q.answer}
 
         if (answerImage) {
           html += `
-<p class="image-title">
+
+<p>
+<strong>
 Mevcut çözüm fotoğrafı
+</strong>
 </p>
 
 <img
@@ -835,8 +1118,11 @@ alt="Çözüm fotoğrafı"
     );
 
     html += `
+
 </div>
+
 </body>
+
 </html>
 `;
 
