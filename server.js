@@ -29,6 +29,11 @@ if (!process.env.SUPABASE_URL) {
 if (!process.env.SUPABASE_SECRET_KEY) {
   throw new Error("Render Environment içinde SUPABASE_SECRET_KEY tanımlanmalı.");
 }
+if (!process.env.ADMIN_USER || !process.env.ADMIN_PASSWORD) {
+  throw new Error(
+    "Render Environment içinde ADMIN_USER ve ADMIN_PASSWORD tanımlanmalı."
+  );
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -111,6 +116,46 @@ app.use("/answers", express.static(answersDir));
 
 const asyncRoute = fn => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
+
+function secureEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left), "utf8");
+  const rightBuffer = Buffer.from(String(right), "utf8");
+  return (
+    leftBuffer.length === rightBuffer.length &&
+    crypto.timingSafeEqual(leftBuffer, rightBuffer)
+  );
+}
+
+function requestAdminLogin(res) {
+  res.set("WWW-Authenticate", 'Basic realm="SorBi Hoca Paneli", charset="UTF-8"');
+  return res.status(401).send("Hoca paneli için giriş yapmalısınız.");
+}
+
+function requireAdmin(req, res, next) {
+  const authorization = req.get("authorization") || "";
+  const [scheme, encoded] = authorization.split(" ");
+  if (scheme !== "Basic" || !encoded) return requestAdminLogin(res);
+
+  let decoded;
+  try {
+    decoded = Buffer.from(encoded, "base64").toString("utf8");
+  } catch (_) {
+    return requestAdminLogin(res);
+  }
+
+  const separator = decoded.indexOf(":");
+  if (separator < 0) return requestAdminLogin(res);
+  const username = decoded.slice(0, separator);
+  const password = decoded.slice(separator + 1);
+
+  if (
+    !secureEqual(username, process.env.ADMIN_USER) ||
+    !secureEqual(password, process.env.ADMIN_PASSWORD)
+  ) {
+    return requestAdminLogin(res);
+  }
+  next();
+}
 
 function escapeHtml(value) {
   return String(value).replace(
@@ -335,6 +380,7 @@ app.get(
 
 app.post(
   "/admin/add-package/:userId",
+  requireAdmin,
   asyncRoute(async (req, res) => {
     await pool.query(
       `INSERT INTO sorbi.users(user_id, paid_credits) VALUES ($1,$2)
@@ -424,11 +470,13 @@ app.get(
 );
 app.get(
   "/questions",
+  requireAdmin,
   asyncRoute(async (req, res) => res.json(await readQuestions()))
 );
 
 app.post(
   "/panel-answer/:id",
+  requireAdmin,
   answerUpload.single("answerFile"),
   asyncRoute(async (req, res) => {
     const id = Number(req.params.id);
@@ -492,6 +540,7 @@ function fileToUrl(filePath, type) {
 
 app.get(
   "/panel",
+  requireAdmin,
   asyncRoute(async (req, res) => {
     const questions = (await readQuestions()).slice().reverse();
     const balanceRows = await pool.query(
@@ -608,9 +657,8 @@ app.use((error, req, res, next) => {
   console.error(
     "İşlem hatası:",
     error.code || error.name || "SERVER_ERROR",
-    error.message || ""
-  );
-  if (res.headersSent) return next(error);
+    error.message || "");
+    if (res.headersSent) return next(error);
   if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
     return res.status(400).json({ error: "Fotoğraf en fazla 10 MB olabilir." });
   }
@@ -621,11 +669,13 @@ app.use((error, req, res, next) => {
   if (req.path.startsWith("/admin/add-package/")) {
     return res.status(500).send("Paket eklenemedi");
   }
+
   const message = req.path.startsWith("/rights/")
     ? "Hak bilgisi alınamadı."
     : req.path.startsWith("/questions")
       ? "Sorular yüklenemedi."
       : "Sunucu hatası oluştu.";
+
   res.status(500).json({ error: message });
 });
 
