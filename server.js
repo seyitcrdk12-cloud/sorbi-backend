@@ -53,8 +53,38 @@ const supabase = createClient(
   }
 );
 
-const imageFileFilter = (req, file, callback) => {
+const allowedImageExtensions = new Set([
+  ".jpg",
+  ".jpeg",
+  ".png",
+  ".webp",
+  ".gif",
+  ".heic",
+  ".heif",
+]);
+
+function imageContentType(file) {
   if (file.mimetype && file.mimetype.startsWith("image/")) {
+    return file.mimetype;
+  }
+  const extension = path.extname(file.originalname || "").toLowerCase();
+  return {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+  }[extension] || "application/octet-stream";
+}
+
+const imageFileFilter = (req, file, callback) => {
+  const extension = path.extname(file.originalname || "").toLowerCase();
+  if (
+    (file.mimetype && file.mimetype.startsWith("image/")) ||
+    allowedImageExtensions.has(extension)
+  ) {
     return callback(null, true);
   }
   callback(new Error("Yalnızca görsel dosyaları yüklenebilir."));
@@ -116,7 +146,7 @@ async function uploadImageToStorage(file, folder) {
     const { error } = await supabase.storage
       .from(STORAGE_BUCKET)
       .upload(storagePath, contents, {
-        contentType: file.mimetype || "application/octet-stream",
+        contentType: imageContentType(file),
         upsert: false,
       });
 
