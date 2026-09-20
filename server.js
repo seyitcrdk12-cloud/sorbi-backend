@@ -678,7 +678,113 @@ app.use((error, req, res, next) => {
 
   res.status(500).json({ error: message });
 });
+app.get("/privacy", (req, res) => {
+  res.type("html").send(`
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SorBi Gizlilik Politikası</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #f8f7fc;
+      color: #25222e;
+      font-family: Arial, sans-serif;
+      line-height: 1.65;
+    }
+    main {
+      max-width: 820px;
+      margin: auto;
+      padding: 28px;
+      background: white;
+      border-radius: 16px;
+      box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08);
+    }
+    h1, h2 { color: #7057e8; }
+    a { color: #5840c9; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>SorBi Gizlilik Politikası</h1>
+  <p><strong>Son güncelleme:</strong> 20 Eylül 2026</p>
 
+  <p>
+    Bu gizlilik politikası, Seyit Çördük tarafından sunulan SorBi
+    uygulamasında kullanıcı verilerinin nasıl işlendiğini açıklar.
+  </p>
+
+  <h2>Toplanan veriler</h2>
+  <ul>
+    <li>Uygulamanın oluşturduğu rastgele kullanıcı kimliği.</li>
+    <li>Kullanıcının gönderdiği soru görselleri.</li>
+    <li>Sorulara ait cevap, durum ve tarih bilgileri.</li>
+    <li>Ücretsiz ve paket soru hakkı bilgileri.</li>
+    <li>Güvenlik ve hata tespiti için gerekli teknik sunucu kayıtları.</li>
+  </ul>
+
+  <p>
+    SorBi; reklam kimliği, kesin konum, rehber, sağlık veya finansal
+    bilgileri bilerek toplamaz. Kullanıcıların gönderdikleri görsellerde
+    kişisel bilgi bulundurmamaları önerilir.
+  </p>
+
+  <h2>Verilerin kullanım amaçları</h2>
+  <ul>
+    <li>Gönderilen soruları öğretmene ulaştırmak ve cevaplamak.</li>
+    <li>Kullanıcının soru ve cevap geçmişini göstermek.</li>
+    <li>Soru haklarını yönetmek.</li>
+    <li>Hizmetin güvenliğini sağlamak ve teknik sorunları gidermek.</li>
+  </ul>
+
+  <h2>Hizmet sağlayıcılar</h2>
+  <p>
+    Veriler, uygulamanın çalışması amacıyla Render ve Supabase gibi
+    altyapı hizmetlerinde işlenebilir ve saklanabilir. Veriler satılmaz
+    veya reklam amacıyla üçüncü taraflarla paylaşılmaz. Yasal bir
+    zorunluluk bulunması hâlinde yetkili kurumlarla paylaşım yapılabilir.
+  </p>
+
+  <h2>Verilerin saklanması ve silinmesi</h2>
+  <p>
+    Veriler, hizmetin sunulması için gerekli olduğu sürece saklanır.
+    Kullanıcılar soru görsellerinin ve ilgili kayıtlarının silinmesini
+    aşağıdaki e-posta adresinden talep edebilir.
+  </p>
+
+  <h2>Güvenlik</h2>
+  <p>
+    Verilerin korunması için makul teknik ve idari önlemler uygulanır.
+    İnternet üzerinden gerçekleştirilen hiçbir aktarım yönteminin yüzde
+    yüz güvenli olduğu garanti edilemez.
+  </p>
+
+  <h2>Çocukların gizliliği</h2>
+  <p>
+    SorBi özellikle 13 yaşın altındaki çocuklara yönelik değildir.
+    13 yaşından küçük bir çocuğa ait verinin gönderildiği fark edilirse,
+    veli veya yasal temsilci silme talebinde bulunabilir.
+  </p>
+
+  <h2>Politika değişiklikleri</h2>
+  <p>
+    Bu politika gerektiğinde güncellenebilir. Güncel metin her zaman bu
+    sayfada yayımlanır.
+  </p>
+
+  <h2>İletişim</h2>
+  <p>
+    Gizlilik ve veri silme talepleri için:
+    <a href="mailto:seyit.crdk12@gmail.com">seyit.crdk12@gmail.com</a>
+  </p>
+</main>
+</body>
+</html>
+  `);
+});
 initializeDatabase()
   .then(() => {
     app.listen(PORT, "0.0.0.0", () =>
