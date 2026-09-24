@@ -675,8 +675,8 @@ button { margin-top: 15px; padding: 12px 20px; background: #7057e8; color: white
       }
 
       html += "</div><div class=\"question-list\">";
-
-      group.questions.forEach(q => {
+group.questions.forEach((q, questionIndex) => {
+        const userQuestionNumber = group.questions.length - questionIndex;
         const questionImage = fileToUrl(q.file, "question");
         const answerImage = q.answerFile ? fileToUrl(q.answerFile, "answer") : "";
         const statusClass = q.status === "cevaplandı" ? "done" : "waiting";
@@ -685,7 +685,7 @@ button { margin-top: 15px; padding: 12px 20px; background: #7057e8; color: white
 <div class="card">
 <div class="top-row">
 <div>
-<h2>Soru ID: ${q.id}</h2>
+<h2>Soru ${userQuestionNumber}</h2>
 <p class="user">${escapeHtml(group.label)} · ${new Date(q.createdAt).toLocaleString("tr-TR")}</p>
 `;
 
