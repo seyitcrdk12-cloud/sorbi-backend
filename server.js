@@ -520,7 +520,28 @@ function cleanUploadPath(filePath) {
   if (normalized.startsWith("uploads/")) return normalized;
   return `uploads/${path.basename(normalized)}`;
 }
+app.post(
+  "/admin/delete-question/:id",
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const id = Number(req.params.id);
 
+    if (!Number.isSafeInteger(id) || id < 1) {
+      return res.status(400).send("Geçersiz soru ID");
+    }
+
+    const result = await pool.query(
+      "DELETE FROM sorbi.questions WHERE id = $1 RETURNING id",
+      [id]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).send("Soru bulunamadı");
+    }
+
+    res.redirect("/panel");
+  })
+);
 function cleanAnswerPath(filePath) {
   if (!filePath) return "";
   const normalized = filePath.replace(/\\/g, "/");
@@ -704,6 +725,13 @@ group.questions.forEach((q, questionIndex) => {
 <input type="file" name="answerFile" accept="image/*">
 <br>
 <button type="submit">Cevabı Kaydet</button>
+</form>
+<form action="/admin/delete-question/${q.id}" method="POST"
+      onsubmit="return confirm('Bu soruyu silmek istediğine emin misin?');">
+  <button type="submit"
+          style="background:#d93025; margin-top:10px;">
+    🗑️ Soruyu Sil
+  </button>
 </form>
 `;
 
