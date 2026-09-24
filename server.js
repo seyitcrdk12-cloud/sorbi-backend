@@ -622,6 +622,15 @@ button { margin-top: 15px; padding: 12px 20px; background: #7057e8; color: white
 .stat strong { display: block; color: #6547d8; font-size: 26px; margin-bottom: 4px; }
 .stat span { color: #666; font-size: 14px; }
 .user-group { background: #ebe7ff; border: 1px solid #ddd6ff; border-radius: 18px; margin-bottom: 18px; overflow: hidden; }
+.user-group.has-waiting {
+  background: #ffe5e5;
+  border: 2px solid #e53935;
+}
+
+.user-group.all-done {
+  background: #ffffff;
+  border: 1px solid #e2e2e2;
+}
 .user-group > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px; cursor: pointer; list-style: none; }
 .user-group > summary::-webkit-details-marker { display: none; }
 .user-group > summary strong { display: block; color: #2b234f; font-size: 20px; }
@@ -668,7 +677,7 @@ button { margin-top: 15px; padding: 12px 20px; background: #7057e8; color: white
     groups.forEach((group, groupIndex) => {
       const shortId = group.userId ? group.userId.slice(-8) : "kayıtsız";
       html += `
-<details class="user-group"${groupIndex === 0 ? " open" : ""}>
+<details class="user-group ${group.waiting > 0 ? "has-waiting" : "all-done"}"${groupIndex === 0 ? " open" : ""}>
 <summary>
 <div>
 <strong>${escapeHtml(group.label)}</strong>
