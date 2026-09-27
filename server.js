@@ -8,7 +8,14 @@ const fs = require("fs");
 const path = require("path");
 const { Pool } = require("pg");
 const { createClient } = require("@supabase/supabase-js");
+const admin = require("firebase-admin");
+const firebaseServiceAccount = JSON.parse(
+  process.env.FIREBASE_SERVICE_ACCOUNT
+);
 
+admin.initializeApp({
+  credential: admin.credential.cert(firebaseServiceAccount),
+});
 const app = express();
 const PORT = process.env.PORT || 3000;
 const FREE_QUESTION_LIMIT = 3;
