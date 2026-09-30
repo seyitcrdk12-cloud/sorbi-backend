@@ -564,7 +564,33 @@ app.post(
        WHERE id = $1`,
       [id, answer, answerImageUrl]
     );
+const tokenResult = await pool.query(
+  `SELECT u.fcm_token
+   FROM sorbi.questions q
+   JOIN sorbi.users u ON u.user_id = q.user_id
+   WHERE q.id = $1`,
+  [id]
+);
 
+const fcmToken = tokenResult.rows[0]?.fcm_token;
+    try {
+  if (fcmToken) {
+    await admin.messaging().send({
+      token: fcmToken,
+      notification: {
+        title: "SorBi",
+        body: "Sorunun cevaplandı 🎉",
+      },
+      data: {
+        questionId: String(id),
+      },
+    });
+
+    console.log("Bildirim gönderildi:", id);
+  }
+} catch (error) {
+  console.error("Bildirim gönderilemedi:", error.message);
+}
     res.redirect("/panel");
   })
 );
