@@ -264,6 +264,17 @@ ADD COLUMN IF NOT EXISTS feedback TEXT;
       ALTER TABLE sorbi.questions ADD COLUMN IF NOT EXISTS subject TEXT NOT NULL DEFAULT 'english';
       ALTER TABLE sorbi.questions ADD COLUMN IF NOT EXISTS answered_by TEXT;
       CREATE INDEX IF NOT EXISTS sorbi_questions_user_idx ON sorbi.questions(user_id);
+      
+      CREATE TABLE IF NOT EXISTS sorbi.play_purchases (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES sorbi.users(user_id),
+        product_id TEXT NOT NULL,
+        order_id TEXT,
+        credits INTEGER NOT NULL CHECK (credits = 15),
+        is_test BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS sorbi_play_order_idx ON sorbi.play_purchases(order_id) WHERE order_id IS NOT NULL;
       CREATE TABLE IF NOT EXISTS sorbi.migrations (name TEXT PRIMARY KEY);
     `);
 
@@ -386,6 +397,120 @@ async function getRightsInfo(userId, db = pool) {
     needsPackage: freeRemaining + paidRemaining <= 0,
   };
 }
+
+// Google Play: verification precedes credit delivery; tokens are stored as hashes.
+const PLAY_PRODUCT = 'sorbi_15_soru';
+const PLAY_PACKAGE = 'com.seyitcorduk.sorbi';
+function billingReady() {
+  return process.env.PLAY_BILLING_ENABLED === 'true' && !!process.env.PLAY_SERVICE_ACCOUNT;
+}
+function billingError(status, code) {
+  return Object.assign(new Error(code), { status, code });
+}
+function playAccountId(userId) {
+  return crypto.createHash('sha256').update('sorbi:' + userId).digest('hex');
+}
+let playAccessToken;
+let playAccessTokenExpires = 0;
+async function playAuthorization() {
+  if (playAccessToken && Date.now() < playAccessTokenExpires) return playAccessToken;
+  const account = JSON.parse(process.env.PLAY_SERVICE_ACCOUNT);
+  if (account.client_email !== 'sorbi-play-billing@sorbi-27bfc.iam.gserviceaccount.com') {
+    throw billingError(503, 'BILLING_CONFIGURATION');
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const unsigned = encode({ alg: 'RS256', typ: 'JWT' }) + '.' + encode({
+    iss: account.client_email, scope: 'https://www.googleapis.com/auth/androidpublisher',
+    aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600,
+  });
+  const signature = crypto.sign('RSA-SHA256', Buffer.from(unsigned), account.private_key).toString('base64url');
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST', signal: AbortSignal.timeout(15000),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: unsigned + '.' + signature }),
+  });
+  if (!response.ok) throw billingError(503, 'PLAY_AUTH_UNAVAILABLE');
+  const result = await response.json();
+  if (!result.access_token) throw billingError(503, 'PLAY_AUTH_UNAVAILABLE');
+  playAccessToken = result.access_token;
+  playAccessTokenExpires = Date.now() + Math.max(0, Number(result.expires_in || 3600) - 120) * 1000;
+  return playAccessToken;
+}
+async function readPlayPurchase(token) {
+  const auth = await playAuthorization();
+  const response = await fetch('https://androidpublisher.googleapis.com/androidpublisher/v3/applications/' +
+    PLAY_PACKAGE + '/purchases/productsv2/tokens/' + encodeURIComponent(token), {
+      headers: { Authorization: 'Bearer ' + auth }, signal: AbortSignal.timeout(15000),
+    });
+  if (response.status === 401) { playAccessToken = null; }
+  if (response.status === 400 || response.status === 404 || response.status === 410) {
+    throw billingError(400, 'INVALID_PURCHASE');
+  }
+  if (!response.ok) throw billingError(503, 'PLAY_VERIFICATION_UNAVAILABLE');
+  return response.json();
+}
+function validatePlayPurchase(purchase, userId) {
+  const state = purchase.purchaseStateContext?.purchaseState;
+  if (state === 'PENDING') throw billingError(409, 'PAYMENT_PENDING');
+  if (state !== 'PURCHASED') throw billingError(400, 'PAYMENT_NOT_COMPLETED');
+  if (purchase.obfuscatedExternalAccountId !== playAccountId(userId)) {
+    throw billingError(403, 'PURCHASE_ACCOUNT_MISMATCH');
+  }
+  const items = purchase.productLineItem;
+  if (!Array.isArray(items) || items.length !== 1 || items[0].productId !== PLAY_PRODUCT) {
+    throw billingError(400, 'WRONG_PRODUCT');
+  }
+  const details = items[0].productOfferDetails || {};
+  if ((details.quantity ?? 1) !== 1 || details.rentOfferDetails || details.preorderOfferDetails ||
+      (details.refundableQuantity !== undefined && details.refundableQuantity !== 1)) {
+    throw billingError(400, 'UNSUPPORTED_PURCHASE');
+  }
+  return { consumed: details.consumptionState === 'CONSUMPTION_STATE_CONSUMED',
+    orderId: purchase.orderId || null, test: !!purchase.testPurchaseContext };
+}
+async function deliverPlayPurchase(userId, token, purchase) {
+  const verified = validatePlayPurchase(purchase, userId);
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  return transaction(async db => {
+    // Serializes simultaneous callbacks, including callbacks across server instances.
+    await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [tokenHash]);
+    const existing = await db.query('SELECT user_id FROM sorbi.play_purchases WHERE token_hash = $1', [tokenHash]);
+    if (existing.rowCount) {
+      if (existing.rows[0].user_id !== userId) throw billingError(403, 'PURCHASE_ACCOUNT_MISMATCH');
+      return { alreadyGranted: true, ...await getRightsInfo(userId, db) };
+    }
+    if (verified.consumed) throw billingError(409, 'CONSUMED_PURCHASE_NOT_RECORDED');
+    await db.query('INSERT INTO sorbi.users(user_id) VALUES ($1) ON CONFLICT DO NOTHING', [userId]);
+    await db.query(`INSERT INTO sorbi.play_purchases(token_hash, user_id, product_id, order_id, credits, is_test)
+      VALUES ($1,$2,$3,$4,15,$5)`, [tokenHash, userId, PLAY_PRODUCT, verified.orderId, verified.test]);
+    await db.query('UPDATE sorbi.users SET paid_credits = paid_credits + 15, updated_at = NOW() WHERE user_id = $1', [userId]);
+    return { alreadyGranted: false, ...await getRightsInfo(userId, db) };
+  });
+}
+app.get('/billing/config/:userId', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!/^user_[A-Za-z0-9_]{1,120}$/.test(req.params.userId)) return res.status(400).json({error:'INVALID_USER'});
+  res.json({ enabled: billingReady(), productId: PLAY_PRODUCT, accountId: playAccountId(req.params.userId) });
+});
+app.post('/billing/google/verify', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    if (!billingReady()) throw billingError(503, 'BILLING_NOT_READY');
+    const { userId, productId, purchaseToken } = req.body || {};
+    if (typeof userId !== 'string' || !/^user_[A-Za-z0-9_]{1,120}$/.test(userId) ||
+        productId !== PLAY_PRODUCT || typeof purchaseToken !== 'string' || purchaseToken.length < 10 || purchaseToken.length > 4096) {
+      throw billingError(400, 'INVALID_REQUEST');
+    }
+    const purchase = await readPlayPurchase(purchaseToken);
+    const result = await deliverPlayPurchase(userId, purchaseToken, purchase);
+    res.json({ verified: true, ...result });
+  } catch (error) {
+    // Never log Google response bodies, purchase tokens or service account material.
+    res.status(error.status || 503).json({error: error.status ? error.code : 'VERIFICATION_RETRY'});
+  }
+});
+
 
 app.get("/", (req, res) => res.send("SorBi server çalışıyor"));
 
@@ -931,7 +1056,10 @@ app.get("/admin/api/dashboard", requireAdmin, asyncRoute(async (req, res) => {
   );
   const questions = result.rows.map(row => ({ ...questionJson(row), displayName: row.display_name || "" }));
   res.set("Cache-Control", "no-store");
-  res.json({ questions, mathTeacher: mathTeacherStats(questions), billingConnected: false });
+  const purchases = await pool.query(
+    'SELECT p.order_id AS "orderId", p.product_id AS "productId", p.credits, p.is_test AS "isTest", p.created_at AS "createdAt", COALESCE(u.display_name, p.user_id) AS "displayName" FROM sorbi.play_purchases p JOIN sorbi.users u ON u.user_id = p.user_id ORDER BY p.created_at DESC LIMIT 100'
+  );
+  res.json({ questions, mathTeacher: mathTeacherStats(questions), billingConnected: billingReady(), purchases: purchases.rows });
 }));
 
 app.use((error, req, res, next) => {
@@ -1081,3 +1209,4 @@ initializeDatabase()
     await pool.end();
     process.exitCode = 1;
   });
+
