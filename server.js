@@ -348,6 +348,7 @@ function questionJson(row) {
     status: row.status,
     answer: row.answer,
     answerFile: row.answer_file,
+    feedback: row.feedback ?? null,
     createdAt: new Date(row.created_at).toISOString(),
     answeredAt: row.answered_at ? new Date(row.answered_at).toISOString() : null,
   };
@@ -409,7 +410,11 @@ app.post(
   "/feedback/:id",
   asyncRoute(async (req, res) => {
     const id = Number(req.params.id);
-    const feedback = req.body.feedback;
+    const feedback = req.body?.feedback;
+
+    if (!Number.isSafeInteger(id) || id < 1) {
+      return res.status(400).json({ error: "Geçersiz soru ID." });
+    }
 
     if (!["helpful", "not_helpful"].includes(feedback)) {
       return res.status(400).json({ error: "Geçersiz geri bildirim." });
