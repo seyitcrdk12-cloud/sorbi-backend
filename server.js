@@ -803,7 +803,7 @@ group.questions.forEach((q, questionIndex) => {
 <div class="top-row">
 <div>
 <h2>Soru ${userQuestionNumber}</h2>
-<p class="user">${escapeHtml(group.label)} · ${new Date(q.createdAt).toLocaleString("tr-TR")}</p>
+<p class="user">${escapeHtml(group.label)} · ${new Date(q.createdAt).toLocaleString("tr-TR", { timeZone: "Europe/Istanbul" })}</p>
 `;
 
 
