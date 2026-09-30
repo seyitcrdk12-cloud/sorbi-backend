@@ -259,6 +259,8 @@ ADD COLUMN IF NOT EXISTS fcm_token TEXT;
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         answered_at TIMESTAMPTZ
       );
+      ALTER TABLE sorbi.questions
+ADD COLUMN IF NOT EXISTS feedback TEXT;
       CREATE INDEX IF NOT EXISTS sorbi_questions_user_idx ON sorbi.questions(user_id);
       CREATE TABLE IF NOT EXISTS sorbi.migrations (name TEXT PRIMARY KEY);
     `);
@@ -401,6 +403,31 @@ app.post(
       [req.params.userId, PACKAGE_QUESTION_COUNT]
     );
     res.redirect("/panel");
+  })
+);
+app.post(
+  "/feedback/:id",
+  asyncRoute(async (req, res) => {
+    const id = Number(req.params.id);
+    const feedback = req.body.feedback;
+
+    if (!["helpful", "not_helpful"].includes(feedback)) {
+      return res.status(400).json({ error: "Geçersiz geri bildirim." });
+    }
+
+    const result = await pool.query(
+      `UPDATE sorbi.questions
+       SET feedback = $2
+       WHERE id = $1
+       RETURNING id`,
+      [id, feedback]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: "Soru bulunamadı." });
+    }
+
+    res.json({ success: true });
   })
 );
 app.post(
@@ -822,6 +849,12 @@ group.questions.forEach((q, questionIndex) => {
 <br>
 <button type="submit">Cevabı Kaydet</button>
 </form>
+${q.feedback === "helpful"
+  ? "<p><strong>Öğrenci geri bildirimi:</strong> 👍 Faydalı</p>"
+  : q.feedback === "not_helpful"
+    ? "<p><strong>Öğrenci geri bildirimi:</strong> 👎 Yetersiz</p>"
+    : "<p><strong>Öğrenci geri bildirimi:</strong> Henüz yok</p>"
+}
 <form action="/admin/delete-question/${q.id}" method="POST"
       onsubmit="return confirm('Bu soruyu silmek istediğine emin misin?');">
   <button type="submit"
