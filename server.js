@@ -261,6 +261,8 @@ ADD COLUMN IF NOT EXISTS fcm_token TEXT;
       );
       ALTER TABLE sorbi.questions
 ADD COLUMN IF NOT EXISTS feedback TEXT;
+      ALTER TABLE sorbi.questions ADD COLUMN IF NOT EXISTS subject TEXT NOT NULL DEFAULT 'english';
+      ALTER TABLE sorbi.questions ADD COLUMN IF NOT EXISTS answered_by TEXT;
       CREATE INDEX IF NOT EXISTS sorbi_questions_user_idx ON sorbi.questions(user_id);
       CREATE TABLE IF NOT EXISTS sorbi.migrations (name TEXT PRIMARY KEY);
     `);
@@ -349,6 +351,8 @@ function questionJson(row) {
     answer: row.answer,
     answerFile: row.answer_file,
     feedback: row.feedback ?? null,
+    subject: row.subject || 'english',
+    answeredBy: row.answered_by || null,
     createdAt: new Date(row.created_at).toISOString(),
     answeredAt: row.answered_at ? new Date(row.answered_at).toISOString() : null,
   };
@@ -496,6 +500,11 @@ app.post(
       return res.status(400).json({ error: "Kullanıcı ID bulunamadı." });
     }
 
+    const subject = req.body.subject || 'english';
+    if (!["english", "math"].includes(subject)) {
+      await removeUpload(req.file);
+      return res.status(400).json({ error: "Geçersiz ders." });
+    }
     let result;
     try {
       result = await transaction(async client => {
@@ -521,9 +530,9 @@ app.post(
 
         const questionImageUrl = await uploadImageToStorage(req.file, "questions");
         const saved = await client.query(
-          `INSERT INTO sorbi.questions(user_id, file, credit_type)
-           VALUES ($1,$2,$3) RETURNING id`,
-          [userId, questionImageUrl, creditType]
+          `INSERT INTO sorbi.questions(user_id, file, credit_type, subject)
+           VALUES ($1,$2,$3,$4) RETURNING id`,
+          [userId, questionImageUrl, creditType, subject]
         );
 
         return {
@@ -564,18 +573,18 @@ app.get(
 );
 
 app.post(
-  "/panel-answer/:id",
+  ["/panel-answer/:id", "/admin/api/answer/:id"],
   requireAdmin,
   answerUpload.single("answerFile"),
   asyncRoute(async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isSafeInteger(id) || id < 1) {
       await removeUpload(req.file);
-      return res.status(404).send("Soru bulunamadı");
+      return res.status(404).json({ error: "Soru bulunamadı." });
     }
 
     const existing = await pool.query(
-      "SELECT id FROM sorbi.questions WHERE id = $1",
+      "SELECT id, answer, answer_file FROM sorbi.questions WHERE id = $1",
       [id]
     );
     if (!existing.rowCount) {
@@ -584,6 +593,9 @@ app.post(
     }
 
     const answer = req.body.answer?.toString().trim() || "";
+    if (!answer && !req.file) {
+      return res.status(400).json({ error: "Yazılı cevap veya çözüm fotoğrafı gerekli." });
+    }
     const answerImageUrl = req.file
       ? await uploadImageToStorage(req.file, "answers")
       : "";
@@ -592,7 +604,8 @@ app.post(
       `UPDATE sorbi.questions SET
          answer = CASE WHEN $2 <> '' THEN $2 ELSE answer END,
          answer_file = CASE WHEN $3 <> '' THEN $3 ELSE answer_file END,
-         status = 'cevaplandı', answered_at = NOW()
+         status = 'cevaplandı', answered_at = NOW(), answered_by = 'admin',
+         feedback = CASE WHEN ($2 <> '' AND $2 IS DISTINCT FROM answer) OR $3 <> '' THEN NULL ELSE feedback END
        WHERE id = $1`,
       [id, answer, answerImageUrl]
     );
@@ -623,6 +636,7 @@ const fcmToken = tokenResult.rows[0]?.fcm_token;
 } catch (error) {
   console.error("Bildirim gönderilemedi:", error.message);
 }
+    if (req.path.startsWith("/admin/api/")) return res.json({ success: true });
     res.redirect("/panel");
   })
 );
@@ -896,6 +910,29 @@ ${escapeHtml(q.answer)}
     res.send(html);
   })
 );
+
+
+function mathTeacherStats(questions) {
+  const math = questions.filter(q => q.subject === "math");
+  const solved = math.filter(q => q.status === "cevaplandı" && q.answeredBy === "math_teacher");
+  return {
+    solved: solved.length,
+    helpful: solved.filter(q => q.feedback === "helpful").length,
+    notHelpful: solved.filter(q => q.feedback === "not_helpful").length,
+    unrated: solved.filter(q => !["helpful", "not_helpful"].includes(q.feedback)).length,
+    waiting: math.filter(q => q.status !== "cevaplandı").length,
+    unattributed: math.filter(q => q.status === "cevaplandı" && !q.answeredBy).length,
+  };
+}
+
+app.get("/admin/api/dashboard", requireAdmin, asyncRoute(async (req, res) => {
+  const result = await pool.query(
+    "SELECT q.*, u.display_name FROM sorbi.questions q LEFT JOIN sorbi.users u ON u.user_id = q.user_id ORDER BY q.id DESC"
+  );
+  const questions = result.rows.map(row => ({ ...questionJson(row), displayName: row.display_name || "" }));
+  res.set("Cache-Control", "no-store");
+  res.json({ questions, mathTeacher: mathTeacherStats(questions), billingConnected: false });
+}));
 
 app.use((error, req, res, next) => {
   console.error(
