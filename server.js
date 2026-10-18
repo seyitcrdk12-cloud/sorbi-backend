@@ -407,6 +407,21 @@ function billingReady() {
 function billingError(status, code) {
   return Object.assign(new Error(code), { status, code });
 }
+async function playVerificationError(response) {
+  let code = 'PLAY_VERIFICATION_UNAVAILABLE';
+  if (response.status === 401) code = 'PLAY_AUTH_UNAVAILABLE';
+  if (response.status === 403) {
+    // Inspect only known reason codes; never expose Google's response body.
+    const body = await response.json().catch(() => null);
+    const errors = Array.isArray(body?.error?.errors) ? body.error.errors : [];
+    const details = Array.isArray(body?.error?.details) ? body.error.details : [];
+    const apiDisabled = [...errors, ...details].some(item =>
+      item?.reason === 'SERVICE_DISABLED' || item?.reason === 'accessNotConfigured'
+    );
+    code = apiDisabled ? 'PLAY_API_DISABLED' : 'PLAY_PERMISSION_DENIED';
+  }
+  return Object.assign(billingError(503, code), { googleHttpStatus: response.status });
+}
 function playAccountId(userId) {
   return crypto.createHash('sha256').update('sorbi:' + userId).digest('hex');
 }
@@ -430,7 +445,9 @@ async function playAuthorization() {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: unsigned + '.' + signature }),
   });
-  if (!response.ok) throw billingError(503, 'PLAY_AUTH_UNAVAILABLE');
+  if (!response.ok) {
+    throw Object.assign(billingError(503, 'PLAY_AUTH_UNAVAILABLE'), { googleHttpStatus: response.status });
+  }
   const result = await response.json();
   if (!result.access_token) throw billingError(503, 'PLAY_AUTH_UNAVAILABLE');
   playAccessToken = result.access_token;
@@ -447,7 +464,7 @@ async function readPlayPurchase(token) {
   if (response.status === 400 || response.status === 404 || response.status === 410) {
     throw billingError(400, 'INVALID_PURCHASE');
   }
-  if (!response.ok) throw billingError(503, 'PLAY_VERIFICATION_UNAVAILABLE');
+  if (!response.ok) throw await playVerificationError(response);
   return response.json();
 }
 function validatePlayPurchase(purchase, userId) {
@@ -507,7 +524,12 @@ app.post('/billing/google/verify', async (req, res) => {
     res.json({ verified: true, ...result });
   } catch (error) {
     // Never log Google response bodies, purchase tokens or service account material.
-    res.status(error.status || 503).json({error: error.status ? error.code : 'VERIFICATION_RETRY'});
+    const result = { error: error.status ? error.code : 'VERIFICATION_RETRY' };
+    if (Number.isInteger(error.googleHttpStatus) && error.googleHttpStatus >= 100 && error.googleHttpStatus <= 599) {
+      result.googleHttpStatus = error.googleHttpStatus;
+    }
+    console.error('Google Play doğrulama hatası:', JSON.stringify(result));
+    res.status(error.status || 503).json(result);
   }
 });
 
