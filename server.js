@@ -164,6 +164,105 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+
+// Öğretmen cihazları yalnızca mevcut yönetici kimlik doğrulaması ile kaydedilir.
+function teacherToken(body) {
+  const token = body && body.fcmToken;
+  if (typeof token !== 'string' || token.length < 10 || token.length > 4096 || /\s/.test(token)) return null;
+  return token;
+}
+app.post('/admin/api/fcm-token', requireAdmin, asyncRoute(async (req, res) => {
+  const token = teacherToken(req.body);
+  if (!token) return res.status(400).json({ error: 'Geçersiz bildirim kimliği.' });
+  await pool.query(
+    'INSERT INTO sorbi.teacher_devices(fcm_token, owner_name) VALUES ($1,$2) ON CONFLICT (fcm_token) DO UPDATE SET owner_name = EXCLUDED.owner_name, updated_at = NOW()',
+    [token, process.env.ADMIN_USER]
+  );
+  res.set('Cache-Control', 'no-store');
+  res.json({ success: true });
+}));
+app.delete('/admin/api/fcm-token', requireAdmin, asyncRoute(async (req, res) => {
+  const token = teacherToken(req.body);
+  if (!token) return res.status(400).json({ error: 'Geçersiz bildirim kimliği.' });
+  await pool.query('DELETE FROM sorbi.teacher_devices WHERE fcm_token = $1 AND owner_name = $2', [token, process.env.ADMIN_USER]);
+  res.json({ success: true });
+}));
+
+async function queueTeacherPush(db, eventKey, payload) {
+  await db.query(
+    'INSERT INTO sorbi.teacher_push_outbox(event_key, fcm_token, payload) SELECT $1, fcm_token, $2::jsonb FROM sorbi.teacher_devices WHERE owner_name = $3 ON CONFLICT DO NOTHING',
+    [eventKey, JSON.stringify(payload), process.env.ADMIN_USER]
+  );
+}
+
+function teacherMessage(job) {
+  const data = job.payload;
+  const type = data.type;
+  const isQuestion = type === 'new_question';
+  const isManual = type === 'credits_granted';
+  const testPrefix = data.isTest === 'true' ? 'TEST · ' : '';
+  return {
+    token: job.fcm_token,
+    notification: {
+      title: isQuestion ? 'Yeni soru geldi' : isManual ? 'Yeni hak verildi' : testPrefix + 'Ödeme doğrulandı',
+      body: isQuestion
+        ? (data.subject === 'math' ? 'Matematik' : 'İngilizce') + ' sorusu çözüm bekliyor.'
+        : isManual ? 'Bir öğrenciye 15 soru hakkı manuel eklendi.' : 'Ödeme doğrulandı, öğrenciye 15 soru hakkı otomatik eklendi.',
+    },
+    data,
+    android: { priority: 'high', ttl: 86400000, notification: { sound: 'default', tag: job.event_key } },
+    apns: { payload: { aps: { sound: 'default' } } },
+  };
+}
+
+let teacherPushRunning = false;
+async function processTeacherPushes() {
+  if (teacherPushRunning) return;
+  teacherPushRunning = true;
+  try {
+    const leaseId = crypto.randomUUID();
+    // Atomik kiralama, birden fazla Render örneğinin aynı işi eşzamanlı almasını engeller.
+    const claimed = await pool.query(
+      `WITH due AS (
+        SELECT o.event_key, o.fcm_token FROM sorbi.teacher_push_outbox o
+        JOIN sorbi.teacher_devices d ON d.fcm_token = o.fcm_token
+        WHERE o.attempts < 8 AND o.next_attempt_at <= NOW()
+          AND d.owner_name = $2
+        ORDER BY o.created_at LIMIT 20 FOR UPDATE OF o SKIP LOCKED
+      ) UPDATE sorbi.teacher_push_outbox o
+        SET attempts = attempts + 1, next_attempt_at = NOW() + INTERVAL '10 minutes', lease_id = $1
+        FROM due WHERE o.event_key = due.event_key AND o.fcm_token = due.fcm_token
+        RETURNING o.*`, [leaseId, process.env.ADMIN_USER]
+    );
+    await Promise.all(claimed.rows.map(async job => {
+      try {
+        await admin.messaging().send(teacherMessage(job));
+        await pool.query('DELETE FROM sorbi.teacher_push_outbox WHERE event_key = $1 AND fcm_token = $2 AND lease_id = $3', [job.event_key, job.fcm_token, leaseId]);
+      } catch (error) {
+        const code = error.code || 'PUSH_RETRY';
+        if (['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'].includes(code)) {
+          await pool.query('DELETE FROM sorbi.teacher_devices WHERE fcm_token = $1', [job.fcm_token]);
+        } else {
+          const delaySeconds = Math.min(21600, 60 * (2 ** Math.min(job.attempts, 8)));
+          await pool.query(
+            `UPDATE sorbi.teacher_push_outbox SET last_error = $4,
+              next_attempt_at = NOW() + ($5 * INTERVAL '1 second')
+              WHERE event_key = $1 AND fcm_token = $2 AND lease_id = $3`,
+            [job.event_key, job.fcm_token, leaseId, code, delaySeconds]
+          );
+          console.error('Öğretmen bildirimi yeniden denenecek:', code);
+        }
+      }
+    }));
+  } catch (error) {
+    console.error('Öğretmen bildirim kuyruğu:', error.code || 'PUSH_QUEUE_ERROR');
+  } finally { teacherPushRunning = false; }
+}
+function startTeacherPushWorker() {
+  void processTeacherPushes();
+  setInterval(() => { void processTeacherPushes(); }, 15000).unref();
+}
+
 function escapeHtml(value) {
   return String(value).replace(
     /[&<>"']/g,
@@ -275,6 +374,25 @@ ADD COLUMN IF NOT EXISTS feedback TEXT;
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE UNIQUE INDEX IF NOT EXISTS sorbi_play_order_idx ON sorbi.play_purchases(order_id) WHERE order_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS sorbi.teacher_devices (
+        fcm_token TEXT PRIMARY KEY,
+        owner_name TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS sorbi.teacher_push_outbox (
+        event_key TEXT NOT NULL,
+        fcm_token TEXT NOT NULL REFERENCES sorbi.teacher_devices(fcm_token) ON DELETE CASCADE,
+        payload JSONB NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        lease_id TEXT,
+        last_error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(event_key, fcm_token)
+      );
+      CREATE INDEX IF NOT EXISTS teacher_push_due_idx
+        ON sorbi.teacher_push_outbox(next_attempt_at) WHERE attempts < 8;
       CREATE TABLE IF NOT EXISTS sorbi.migrations (name TEXT PRIMARY KEY);
     `);
 
@@ -502,6 +620,9 @@ async function deliverPlayPurchase(userId, token, purchase) {
     await db.query(`INSERT INTO sorbi.play_purchases(token_hash, user_id, product_id, order_id, credits, is_test)
       VALUES ($1,$2,$3,$4,15,$5)`, [tokenHash, userId, PLAY_PRODUCT, verified.orderId, verified.test]);
     await db.query('UPDATE sorbi.users SET paid_credits = paid_credits + 15, updated_at = NOW() WHERE user_id = $1', [userId]);
+    await queueTeacherPush(db, 'purchase:' + tokenHash, {
+      type: 'payment_received', userId, credits: '15', isTest: String(verified.test),
+    });
     return { alreadyGranted: false, ...await getRightsInfo(userId, db) };
   });
 }
@@ -522,6 +643,7 @@ app.post('/billing/google/verify', async (req, res) => {
     const purchase = await readPlayPurchase(purchaseToken);
     const result = await deliverPlayPurchase(userId, purchaseToken, purchase);
     res.json({ verified: true, ...result });
+    void processTeacherPushes();
   } catch (error) {
     // Never log Google response bodies, purchase tokens or service account material.
     const result = { error: error.status ? error.code : 'VERIFICATION_RETRY' };
@@ -547,14 +669,20 @@ app.post(
   "/admin/add-package/:userId",
   requireAdmin,
   asyncRoute(async (req, res) => {
-    await pool.query(
+    await transaction(async db => {
+    await db.query(
       `INSERT INTO sorbi.users(user_id, paid_credits) VALUES ($1,$2)
        ON CONFLICT (user_id) DO UPDATE
        SET paid_credits = sorbi.users.paid_credits + EXCLUDED.paid_credits,
            updated_at = NOW()`,
       [req.params.userId, PACKAGE_QUESTION_COUNT]
     );
+    await queueTeacherPush(db, 'manual:' + crypto.randomUUID(), {
+      type: 'credits_granted', userId: req.params.userId, credits: String(PACKAGE_QUESTION_COUNT),
+    });
+    });
     res.redirect("/panel");
+    void processTeacherPushes();
   })
 );
 app.post(
@@ -682,6 +810,9 @@ app.post(
           [userId, questionImageUrl, creditType, subject]
         );
 
+        await queueTeacherPush(client, 'question:' + saved.rows[0].id, {
+          type: 'new_question', subject, questionId: String(saved.rows[0].id),
+        });
         return {
           result: "Sorun hocana ulaştı.",
           id: Number(saved.rows[0].id),
@@ -706,6 +837,7 @@ app.post(
     }
 
     res.json(result);
+    void processTeacherPushes();
   })
 );
 
@@ -1218,6 +1350,7 @@ app.get("/privacy", (req, res) => {
 });
 initializeDatabase()
   .then(() => {
+    startTeacherPushWorker();
     app.listen(PORT, "0.0.0.0", () =>
       console.log(`SorBi server çalışıyor: ${PORT}`)
     );
