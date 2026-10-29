@@ -175,7 +175,7 @@ app.post('/admin/api/fcm-token', requireAdmin, asyncRoute(async (req, res) => {
   const token = teacherToken(req.body);
   if (!token) return res.status(400).json({ error: 'Geçersiz bildirim kimliği.' });
   await pool.query(
-    'INSERT INTO sorbi.teacher_devices(fcm_token, owner_name) VALUES ($1,$2) ON CONFLICT (fcm_token) DO UPDATE SET owner_name = EXCLUDED.owner_name, updated_at = NOW()',
+    "INSERT INTO sorbi.teacher_devices(fcm_token, owner_name, role) VALUES ($1,$2,'admin') ON CONFLICT (fcm_token) DO UPDATE SET owner_name = EXCLUDED.owner_name, role = 'admin', updated_at = NOW()",
     [token, process.env.ADMIN_USER]
   );
   res.set('Cache-Control', 'no-store');
@@ -184,14 +184,20 @@ app.post('/admin/api/fcm-token', requireAdmin, asyncRoute(async (req, res) => {
 app.delete('/admin/api/fcm-token', requireAdmin, asyncRoute(async (req, res) => {
   const token = teacherToken(req.body);
   if (!token) return res.status(400).json({ error: 'Geçersiz bildirim kimliği.' });
-  await pool.query('DELETE FROM sorbi.teacher_devices WHERE fcm_token = $1 AND owner_name = $2', [token, process.env.ADMIN_USER]);
+  await pool.query("DELETE FROM sorbi.teacher_devices WHERE fcm_token = $1 AND owner_name = $2 AND role = 'admin'", [token, process.env.ADMIN_USER]);
   res.json({ success: true });
 }));
 
 async function queueTeacherPush(db, eventKey, payload) {
+  // Ödeme ve manuel hak olayları yalnızca yöneticiye; matematik soruları iki yetkili role gider.
   await db.query(
-    'INSERT INTO sorbi.teacher_push_outbox(event_key, fcm_token, payload) SELECT $1, fcm_token, $2::jsonb FROM sorbi.teacher_devices WHERE owner_name = $3 ON CONFLICT DO NOTHING',
-    [eventKey, JSON.stringify(payload), process.env.ADMIN_USER]
+    `INSERT INTO sorbi.teacher_push_outbox(event_key, fcm_token, payload)
+     SELECT $1, fcm_token, $2::jsonb FROM sorbi.teacher_devices
+     WHERE (role = 'admin' AND owner_name = $3)
+        OR (role = 'math_teacher' AND owner_name = $4 AND $5 = 'new_question' AND $6 = 'math')
+     ON CONFLICT DO NOTHING`,
+    [eventKey, JSON.stringify(payload), process.env.ADMIN_USER,
+     mathTeacherConfigured() ? process.env.MATH_TEACHER_USER : null, payload.type, payload.subject || '']
   );
 }
 
@@ -227,12 +233,14 @@ async function processTeacherPushes() {
         SELECT o.event_key, o.fcm_token FROM sorbi.teacher_push_outbox o
         JOIN sorbi.teacher_devices d ON d.fcm_token = o.fcm_token
         WHERE o.attempts < 8 AND o.next_attempt_at <= NOW()
-          AND d.owner_name = $2
+          AND ((d.role = 'admin' AND d.owner_name = $2)
+            OR (d.role = 'math_teacher' AND d.owner_name = $3
+              AND o.payload->>'type' = 'new_question' AND o.payload->>'subject' = 'math'))
         ORDER BY o.created_at LIMIT 20 FOR UPDATE OF o SKIP LOCKED
       ) UPDATE sorbi.teacher_push_outbox o
         SET attempts = attempts + 1, next_attempt_at = NOW() + INTERVAL '10 minutes', lease_id = $1
         FROM due WHERE o.event_key = due.event_key AND o.fcm_token = due.fcm_token
-        RETURNING o.*`, [leaseId, process.env.ADMIN_USER]
+        RETURNING o.*`, [leaseId, process.env.ADMIN_USER, mathTeacherConfigured() ? process.env.MATH_TEACHER_USER : null]
     );
     await Promise.all(claimed.rows.map(async job => {
       try {
@@ -262,6 +270,40 @@ function startTeacherPushWorker() {
   void processTeacherPushes();
   setInterval(() => { void processTeacherPushes(); }, 15000).unref();
 }
+
+
+function mathTeacherConfigured() {
+  return Boolean(process.env.MATH_TEACHER_USER && process.env.MATH_TEACHER_PASSWORD) &&
+    !(secureEqual(process.env.MATH_TEACHER_USER, process.env.ADMIN_USER) &&
+      secureEqual(process.env.MATH_TEACHER_PASSWORD, process.env.ADMIN_PASSWORD));
+}
+function requireMathTeacher(req, res, next) {
+  if (!mathTeacherConfigured()) return res.status(503).json({ error: 'Matematik hocası hesabı henüz tanımlanmadı.' });
+  const [scheme, encoded] = (req.get('authorization') || '').split(' ');
+  let decoded = '';
+  try { if (encoded) decoded = Buffer.from(encoded, 'base64').toString('utf8'); } catch (_) {}
+  const separator = decoded.indexOf(':');
+  if (scheme !== 'Basic' || separator < 0 ||
+      !secureEqual(decoded.slice(0, separator), process.env.MATH_TEACHER_USER) ||
+      !secureEqual(decoded.slice(separator + 1), process.env.MATH_TEACHER_PASSWORD)) {
+    return res.status(401).json({ error: 'Kullanıcı adı veya şifre yanlış.' });
+  }
+  req.teacherRole = 'math_teacher';
+  next();
+}
+function requireAnswerTeacher(req, res, next) {
+  if (req.path.startsWith('/teacher/api/')) return requireMathTeacher(req, res, next);
+  req.teacherRole = 'admin';
+  return requireAdmin(req, res, next);
+}
+const requireMathQuestion = asyncRoute(async (req, res, next) => {
+  if (req.teacherRole !== 'math_teacher') return next();
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(404).json({ error: 'Soru bulunamadı.' });
+  const found = await pool.query("SELECT id FROM sorbi.questions WHERE id = $1 AND subject = 'math'", [id]);
+  if (!found.rowCount) return res.status(404).json({ error: 'Soru bulunamadı.' });
+  next();
+});
 
 function escapeHtml(value) {
   return String(value).replace(
@@ -378,8 +420,10 @@ ADD COLUMN IF NOT EXISTS feedback TEXT;
       CREATE TABLE IF NOT EXISTS sorbi.teacher_devices (
         fcm_token TEXT PRIMARY KEY,
         owner_name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'admin',
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      ALTER TABLE sorbi.teacher_devices ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'admin';
       CREATE TABLE IF NOT EXISTS sorbi.teacher_push_outbox (
         event_key TEXT NOT NULL,
         fcm_token TEXT NOT NULL REFERENCES sorbi.teacher_devices(fcm_token) ON DELETE CASCADE,
@@ -852,8 +896,9 @@ app.get(
 );
 
 app.post(
-  ["/panel-answer/:id", "/admin/api/answer/:id"],
-  requireAdmin,
+  ["/panel-answer/:id", "/admin/api/answer/:id", "/teacher/api/answer/:id"],
+  requireAnswerTeacher,
+  requireMathQuestion,
   answerUpload.single("answerFile"),
   asyncRoute(async (req, res) => {
     const id = Number(req.params.id);
@@ -863,8 +908,8 @@ app.post(
     }
 
     const existing = await pool.query(
-      "SELECT id, answer, answer_file FROM sorbi.questions WHERE id = $1",
-      [id]
+      "SELECT id, answer, answer_file FROM sorbi.questions WHERE id = $1 AND ($2::boolean = FALSE OR subject = 'math')",
+      [id, req.teacherRole === 'math_teacher']
     );
     if (!existing.rowCount) {
       await removeUpload(req.file);
@@ -879,15 +924,16 @@ app.post(
       ? await uploadImageToStorage(req.file, "answers")
       : "";
 
-    await pool.query(
+    const updated = await pool.query(
       `UPDATE sorbi.questions SET
          answer = CASE WHEN $2 <> '' THEN $2 ELSE answer END,
          answer_file = CASE WHEN $3 <> '' THEN $3 ELSE answer_file END,
-         status = 'cevaplandı', answered_at = NOW(), answered_by = 'admin',
+         status = 'cevaplandı', answered_at = NOW(), answered_by = $4,
          feedback = CASE WHEN ($2 <> '' AND $2 IS DISTINCT FROM answer) OR $3 <> '' THEN NULL ELSE feedback END
-       WHERE id = $1`,
-      [id, answer, answerImageUrl]
+       WHERE id = $1 AND ($5::boolean = FALSE OR subject = 'math') RETURNING id`,
+      [id, answer, answerImageUrl, req.teacherRole === 'math_teacher' ? 'math_teacher' : 'admin', req.teacherRole === 'math_teacher']
     );
+    if (!updated.rowCount) return res.status(404).json({ error: 'Soru bulunamadı.' });
 const tokenResult = await pool.query(
   `SELECT u.fcm_token
    FROM sorbi.questions q
@@ -915,7 +961,7 @@ const fcmToken = tokenResult.rows[0]?.fcm_token;
 } catch (error) {
   console.error("Bildirim gönderilemedi:", error.message);
 }
-    if (req.path.startsWith("/admin/api/")) return res.json({ success: true });
+    if (req.path.startsWith("/admin/api/") || req.path.startsWith("/teacher/api/")) return res.json({ success: true });
     res.redirect("/panel");
   })
 );
@@ -1203,6 +1249,33 @@ function mathTeacherStats(questions) {
     unattributed: math.filter(q => q.status === "cevaplandı" && !q.answeredBy).length,
   };
 }
+
+
+app.post('/teacher/api/fcm-token', requireMathTeacher, asyncRoute(async (req, res) => {
+  const token = teacherToken(req.body);
+  if (!token) return res.status(400).json({ error: 'Geçersiz bildirim kimliği.' });
+  await pool.query(
+    `INSERT INTO sorbi.teacher_devices(fcm_token, owner_name, role) VALUES ($1,$2,'math_teacher')
+       ON CONFLICT (fcm_token) DO UPDATE SET owner_name = EXCLUDED.owner_name, role = 'math_teacher', updated_at = NOW()`,
+    [token, process.env.MATH_TEACHER_USER]
+  );
+  res.set('Cache-Control', 'no-store');
+  res.json({ success: true });
+}));
+app.delete('/teacher/api/fcm-token', requireMathTeacher, asyncRoute(async (req, res) => {
+  const token = teacherToken(req.body);
+  if (!token) return res.status(400).json({ error: 'Geçersiz bildirim kimliği.' });
+  await pool.query("DELETE FROM sorbi.teacher_devices WHERE fcm_token = $1 AND owner_name = $2 AND role = 'math_teacher'", [token, process.env.MATH_TEACHER_USER]);
+  res.json({ success: true });
+}));
+app.get('/teacher/api/dashboard', requireMathTeacher, asyncRoute(async (req, res) => {
+  const result = await pool.query(
+    "SELECT q.*, u.display_name FROM sorbi.questions q LEFT JOIN sorbi.users u ON u.user_id = q.user_id WHERE q.subject = 'math' ORDER BY q.id DESC"
+  );
+  const questions = result.rows.map(row => ({ ...questionJson(row), displayName: row.display_name || '' }));
+  res.set('Cache-Control', 'no-store');
+  res.json({ questions, mathTeacher: mathTeacherStats(questions) });
+}));
 
 app.get("/admin/api/dashboard", requireAdmin, asyncRoute(async (req, res) => {
   const result = await pool.query(
