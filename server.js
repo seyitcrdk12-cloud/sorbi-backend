@@ -189,15 +189,17 @@ app.delete('/admin/api/fcm-token', requireAdmin, asyncRoute(async (req, res) => 
 }));
 
 async function queueTeacherPush(db, eventKey, payload) {
-  // Ödeme ve manuel hak olayları yalnızca yöneticiye; matematik soruları iki yetkili role gider.
+  // Ödeme ve manuel hak olayları yalnızca yöneticiye; ders soruları yönetici ve ilgili hocaya gider.
   await db.query(
     `INSERT INTO sorbi.teacher_push_outbox(event_key, fcm_token, payload)
      SELECT $1, fcm_token, $2::jsonb FROM sorbi.teacher_devices
      WHERE (role = 'admin' AND owner_name = $3)
         OR (role = 'math_teacher' AND owner_name = $4 AND $5 = 'new_question' AND $6 = 'math')
+        OR (role = 'biology_teacher' AND owner_name = $7 AND $5 = 'new_question' AND $6 = 'biology')
      ON CONFLICT DO NOTHING`,
     [eventKey, JSON.stringify(payload), process.env.ADMIN_USER,
-     mathTeacherConfigured() ? process.env.MATH_TEACHER_USER : null, payload.type, payload.subject || '']
+     mathTeacherConfigured() ? process.env.MATH_TEACHER_USER : null, payload.type, payload.subject || '',
+     biologyTeacherConfigured() ? process.env.BIOLOGY_TEACHER_USER : null]
   );
 }
 
@@ -212,7 +214,7 @@ function teacherMessage(job) {
     notification: {
       title: isQuestion ? 'Yeni soru geldi' : isManual ? 'Yeni hak verildi' : testPrefix + 'Ödeme doğrulandı',
       body: isQuestion
-        ? (data.subject === 'math' ? 'Matematik' : 'İngilizce') + ' sorusu çözüm bekliyor.'
+        ? ({ english: 'İngilizce', math: 'Matematik', biology: 'Biyoloji' }[data.subject] || 'Ders') + ' sorusu çözüm bekliyor.'
         : isManual ? 'Bir öğrenciye 15 soru hakkı manuel eklendi.' : 'Ödeme doğrulandı, öğrenciye 15 soru hakkı otomatik eklendi.',
     },
     data,
@@ -235,12 +237,14 @@ async function processTeacherPushes() {
         WHERE o.attempts < 8 AND o.next_attempt_at <= NOW()
           AND ((d.role = 'admin' AND d.owner_name = $2)
             OR (d.role = 'math_teacher' AND d.owner_name = $3
-              AND o.payload->>'type' = 'new_question' AND o.payload->>'subject' = 'math'))
+              AND o.payload->>'type' = 'new_question' AND o.payload->>'subject' = 'math')
+            OR (d.role = 'biology_teacher' AND d.owner_name = $4
+              AND o.payload->>'type' = 'new_question' AND o.payload->>'subject' = 'biology'))
         ORDER BY o.created_at LIMIT 20 FOR UPDATE OF o SKIP LOCKED
       ) UPDATE sorbi.teacher_push_outbox o
         SET attempts = attempts + 1, next_attempt_at = NOW() + INTERVAL '10 minutes', lease_id = $1
         FROM due WHERE o.event_key = due.event_key AND o.fcm_token = due.fcm_token
-        RETURNING o.*`, [leaseId, process.env.ADMIN_USER, mathTeacherConfigured() ? process.env.MATH_TEACHER_USER : null]
+        RETURNING o.*`, [leaseId, process.env.ADMIN_USER, mathTeacherConfigured() ? process.env.MATH_TEACHER_USER : null, biologyTeacherConfigured() ? process.env.BIOLOGY_TEACHER_USER : null]
     );
     await Promise.all(claimed.rows.map(async job => {
       try {
@@ -289,18 +293,45 @@ function requireMathTeacher(req, res, next) {
     return res.status(401).json({ error: 'Kullanıcı adı veya şifre yanlış.' });
   }
   req.teacherRole = 'math_teacher';
+  req.teacherSubject = 'math';
   next();
 }
+
+function biologyTeacherConfigured() {
+  const user = process.env.BIOLOGY_TEACHER_USER, password = process.env.BIOLOGY_TEACHER_PASSWORD;
+  return Boolean(user && password) &&
+    !(secureEqual(user, process.env.ADMIN_USER) && secureEqual(password, process.env.ADMIN_PASSWORD)) &&
+    !(secureEqual(user, process.env.MATH_TEACHER_USER) && secureEqual(password, process.env.MATH_TEACHER_PASSWORD));
+}
+function requireBiologyTeacher(req, res, next) {
+  if (!biologyTeacherConfigured()) return res.status(503).json({ error: 'Biyoloji hocası hesabı henüz tanımlanmadı.' });
+  const [scheme, encoded] = (req.get('authorization') || '').split(' ');
+  let decoded = '';
+  try { if (encoded) decoded = Buffer.from(encoded, 'base64').toString('utf8'); } catch (_) {}
+  const separator = decoded.indexOf(':');
+  if (scheme !== 'Basic' || separator < 0 ||
+      !secureEqual(decoded.slice(0, separator), process.env.BIOLOGY_TEACHER_USER) ||
+      !secureEqual(decoded.slice(separator + 1), process.env.BIOLOGY_TEACHER_PASSWORD)) {
+    return res.status(401).json({ error: 'Kullanıcı adı veya şifre yanlış.' });
+  }
+  req.teacherRole = 'biology_teacher';
+  req.teacherSubject = 'biology';
+  next();
+}
+
 function requireAnswerTeacher(req, res, next) {
+  if (req.path.startsWith('/biology/api/')) return requireBiologyTeacher(req, res, next);
   if (req.path.startsWith('/teacher/api/')) return requireMathTeacher(req, res, next);
   req.teacherRole = 'admin';
+  req.teacherSubject = null;
   return requireAdmin(req, res, next);
 }
-const requireMathQuestion = asyncRoute(async (req, res, next) => {
-  if (req.teacherRole !== 'math_teacher') return next();
+const requireSubjectQuestion = asyncRoute(async (req, res, next) => {
+  if (req.teacherRole === 'admin') return next();
+  if (!['math', 'biology'].includes(req.teacherSubject)) return res.status(403).json({ error: 'Yetkiniz yok.' });
   const id = Number(req.params.id);
   if (!Number.isSafeInteger(id) || id < 1) return res.status(404).json({ error: 'Soru bulunamadı.' });
-  const found = await pool.query("SELECT id FROM sorbi.questions WHERE id = $1 AND subject = 'math'", [id]);
+  const found = await pool.query('SELECT id FROM sorbi.questions WHERE id = $1 AND subject = $2', [id, req.teacherSubject]);
   if (!found.rowCount) return res.status(404).json({ error: 'Soru bulunamadı.' });
   next();
 });
@@ -820,7 +851,7 @@ app.post(
     }
 
     const subject = req.body.subject || 'english';
-    if (!["english", "math"].includes(subject)) {
+    if (!["english", "math", "biology"].includes(subject)) {
       await removeUpload(req.file);
       return res.status(400).json({ error: "Geçersiz ders." });
     }
@@ -896,9 +927,9 @@ app.get(
 );
 
 app.post(
-  ["/panel-answer/:id", "/admin/api/answer/:id", "/teacher/api/answer/:id"],
+  ["/panel-answer/:id", "/admin/api/answer/:id", "/teacher/api/answer/:id", "/biology/api/answer/:id"],
   requireAnswerTeacher,
-  requireMathQuestion,
+  requireSubjectQuestion,
   answerUpload.single("answerFile"),
   asyncRoute(async (req, res) => {
     const id = Number(req.params.id);
@@ -908,8 +939,8 @@ app.post(
     }
 
     const existing = await pool.query(
-      "SELECT id, answer, answer_file FROM sorbi.questions WHERE id = $1 AND ($2::boolean = FALSE OR subject = 'math')",
-      [id, req.teacherRole === 'math_teacher']
+      "SELECT id, answer, answer_file FROM sorbi.questions WHERE id = $1 AND ($2::text IS NULL OR subject = $2)",
+      [id, req.teacherSubject]
     );
     if (!existing.rowCount) {
       await removeUpload(req.file);
@@ -930,8 +961,8 @@ app.post(
          answer_file = CASE WHEN $3 <> '' THEN $3 ELSE answer_file END,
          status = 'cevaplandı', answered_at = NOW(), answered_by = $4,
          feedback = CASE WHEN ($2 <> '' AND $2 IS DISTINCT FROM answer) OR $3 <> '' THEN NULL ELSE feedback END
-       WHERE id = $1 AND ($5::boolean = FALSE OR subject = 'math') RETURNING id`,
-      [id, answer, answerImageUrl, req.teacherRole === 'math_teacher' ? 'math_teacher' : 'admin', req.teacherRole === 'math_teacher']
+       WHERE id = $1 AND ($5::text IS NULL OR subject = $5) RETURNING id`,
+      [id, answer, answerImageUrl, req.teacherRole, req.teacherSubject]
     );
     if (!updated.rowCount) return res.status(404).json({ error: 'Soru bulunamadı.' });
 const tokenResult = await pool.query(
@@ -961,7 +992,7 @@ const fcmToken = tokenResult.rows[0]?.fcm_token;
 } catch (error) {
   console.error("Bildirim gönderilemedi:", error.message);
 }
-    if (req.path.startsWith("/admin/api/") || req.path.startsWith("/teacher/api/")) return res.json({ success: true });
+    if (req.path.startsWith("/admin/api/") || req.path.startsWith("/teacher/api/") || req.path.startsWith("/biology/api/")) return res.json({ success: true });
     res.redirect("/panel");
   })
 );
@@ -1251,6 +1282,21 @@ function mathTeacherStats(questions) {
 }
 
 
+function biologyTeacherStats(questions) {
+  const biology = questions.filter(q => q.subject === "biology");
+  const solved = biology.filter(q => q.status === "cevaplandı" && q.answeredBy === "biology_teacher");
+  return {
+    solved: solved.length,
+    helpful: solved.filter(q => q.feedback === "helpful").length,
+    notHelpful: solved.filter(q => q.feedback === "not_helpful").length,
+    unrated: solved.filter(q => !["helpful", "not_helpful"].includes(q.feedback)).length,
+    waiting: biology.filter(q => q.status !== "cevaplandı").length,
+    unattributed: biology.filter(q => q.status === "cevaplandı" && !q.answeredBy).length,
+  };
+}
+
+
+
 app.post('/teacher/api/fcm-token', requireMathTeacher, asyncRoute(async (req, res) => {
   const token = teacherToken(req.body);
   if (!token) return res.status(400).json({ error: 'Geçersiz bildirim kimliği.' });
@@ -1277,6 +1323,33 @@ app.get('/teacher/api/dashboard', requireMathTeacher, asyncRoute(async (req, res
   res.json({ questions, mathTeacher: mathTeacherStats(questions) });
 }));
 
+app.post('/biology/api/fcm-token', requireBiologyTeacher, asyncRoute(async (req, res) => {
+  const token = teacherToken(req.body);
+  if (!token) return res.status(400).json({ error: 'Geçersiz bildirim kimliği.' });
+  await pool.query(
+    `INSERT INTO sorbi.teacher_devices(fcm_token, owner_name, role) VALUES ($1,$2,'biology_teacher')
+       ON CONFLICT (fcm_token) DO UPDATE SET owner_name = EXCLUDED.owner_name, role = 'biology_teacher', updated_at = NOW()`,
+    [token, process.env.BIOLOGY_TEACHER_USER]
+  );
+  res.set('Cache-Control', 'no-store');
+  res.json({ success: true });
+}));
+app.delete('/biology/api/fcm-token', requireBiologyTeacher, asyncRoute(async (req, res) => {
+  const token = teacherToken(req.body);
+  if (!token) return res.status(400).json({ error: 'Geçersiz bildirim kimliği.' });
+  await pool.query("DELETE FROM sorbi.teacher_devices WHERE fcm_token = $1 AND owner_name = $2 AND role = 'biology_teacher'", [token, process.env.BIOLOGY_TEACHER_USER]);
+  res.json({ success: true });
+}));
+app.get('/biology/api/dashboard', requireBiologyTeacher, asyncRoute(async (req, res) => {
+  const result = await pool.query(
+    "SELECT q.*, u.display_name FROM sorbi.questions q LEFT JOIN sorbi.users u ON u.user_id = q.user_id WHERE q.subject = 'biology' ORDER BY q.id DESC"
+  );
+  const questions = result.rows.map(row => ({ ...questionJson(row), displayName: row.display_name || '' }));
+  res.set('Cache-Control', 'no-store');
+  res.json({ questions, biologyTeacher: biologyTeacherStats(questions) });
+}));
+
+
 app.get("/admin/api/dashboard", requireAdmin, asyncRoute(async (req, res) => {
   const result = await pool.query(
     "SELECT q.*, u.display_name FROM sorbi.questions q LEFT JOIN sorbi.users u ON u.user_id = q.user_id ORDER BY q.id DESC"
@@ -1286,7 +1359,7 @@ app.get("/admin/api/dashboard", requireAdmin, asyncRoute(async (req, res) => {
   const purchases = await pool.query(
     'SELECT p.order_id AS "orderId", p.product_id AS "productId", p.credits, p.is_test AS "isTest", p.created_at AS "createdAt", COALESCE(u.display_name, p.user_id) AS "displayName" FROM sorbi.play_purchases p JOIN sorbi.users u ON u.user_id = p.user_id ORDER BY p.created_at DESC LIMIT 100'
   );
-  res.json({ questions, mathTeacher: mathTeacherStats(questions), billingConnected: billingReady(), purchases: purchases.rows });
+  res.json({ questions, mathTeacher: mathTeacherStats(questions), biologyTeacher: biologyTeacherStats(questions), billingConnected: billingReady(), purchases: purchases.rows });
 }));
 
 app.use((error, req, res, next) => {
