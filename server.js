@@ -447,6 +447,8 @@ ADD COLUMN IF NOT EXISTS feedback TEXT;
         id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, question_id BIGINT REFERENCES sorbi.questions(id) ON DELETE CASCADE,
         kind TEXT NOT NULL, detail TEXT NOT NULL, reply TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW()
       );
+      ALTER TABLE sorbi.requests ADD COLUMN IF NOT EXISTS media_path TEXT;
+      ALTER TABLE sorbi.requests ADD COLUMN IF NOT EXISTS media_kind TEXT;
       CREATE INDEX IF NOT EXISTS requests_owner ON sorbi.requests(user_id,id);
       CREATE TABLE IF NOT EXISTS sorbi.play_purchases (
         token_hash TEXT PRIMARY KEY,
@@ -758,14 +760,79 @@ async function refreshMembership(userId) {
   throw Object.assign(new Error('Google Play aboneliği doğrulanamadı. Tekrar dene.'),{requestStatus:503});
 }
 
+const mediaBucket = 'sorbi-explanations';
+const mediaLimit = 40 * 1024 * 1024;
+const mediaUpload = multer({dest:require('os').tmpdir(),limits:{fileSize:mediaLimit,files:1,fields:1}});
+let bucketReady;
+function ensureMediaBucket() {
+  if (!bucketReady) bucketReady = (async () => {
+    const {error} = await supabase.storage.createBucket(mediaBucket,{public:false,fileSizeLimit:mediaLimit});
+    if(error && !/already exists|duplicate/i.test(error.message)) throw error;
+    const result=await supabase.storage.getBucket(mediaBucket);
+    if(result.error || result.data?.public !== false) throw new Error('Özel medya deposu açılamadı.');
+  })().catch(e=>{bucketReady=null;throw e;});
+  return bucketReady;
+}
+function mediaFormat(bytes,kind) {
+  const head=bytes.subarray(0,12).toString('latin1');
+  if(head.slice(4,8)==='ftyp') return kind==='video'?['mp4','video/mp4']:['m4a','audio/mp4'];
+  if(kind!=='audio')return null;
+  if(head.startsWith('OggS'))return ['ogg','audio/ogg'];
+  if(head.startsWith('RIFF') && head.endsWith('WAVE'))return ['wav','audio/wav'];
+  if(head.startsWith('ID3') || (bytes[0]===255 && (bytes[1]&224)===224))return ['mp3','audio/mpeg'];
+  return null;
+}
+app.post('/admin/api/requests/:id/media',requireAdmin,(req,res,next)=>{
+  mediaUpload.single('media')(req,res,error=>error?res.status(400).json({error:'Tek dosya seç. Üst sınır 40 MB.'}):next());
+},asyncRoute(async(req,res)=>{
+  const file=req.file, kind=req.body.kind;
+  let savedPath;
+  try{
+    if(!file || !['audio','video'].includes(kind))return res.status(400).json({error:'Ses veya video dosyası seç.'});
+    if(!/^\d+$/.test(req.params.id))return res.sendStatus(404);
+    const bytes=await fs.promises.readFile(file.path);
+    const format=mediaFormat(bytes,kind);
+    if(!format)return res.status(415).json({error:'Video için MP4; ses için M4A, MP3, OGG veya WAV seç.'});
+    await ensureMediaBucket();
+    const key=req.params.id+'/'+crypto.randomUUID()+'.'+format[0];
+    const bucket=supabase.storage.from(mediaBucket);
+    const uploaded=await bucket.upload(key,bytes,{contentType:format[1]});
+    if(uploaded.error)throw uploaded.error;
+    savedPath=key;
+    const previous=await transaction(async db=>{
+      const row=await db.query('SELECT media_path FROM sorbi.requests WHERE id=$1 FOR UPDATE',[req.params.id]);
+      if(!row.rowCount)throw Object.assign(new Error('Talep bulunamadı.'),{requestStatus:404});
+      await db.query('UPDATE sorbi.requests SET media_path=$2,media_kind=$3 WHERE id=$1',[req.params.id,key,kind]);
+      return row.rows[0].media_path;
+    });
+    savedPath=null;
+    if(previous)await bucket.remove([previous]).catch(()=>{});
+    res.json({ok:true});
+  }finally{
+    await removeUpload(file);
+    if(savedPath)await supabase.storage.from(mediaBucket).remove([savedPath]).catch(()=>{});
+  }
+}));
+async function playMedia(req,res){
+  const isAdmin=req.path.startsWith('/admin/');
+  const params=isAdmin?[req.params.id]:[req.params.id,req.params.userId];
+  const result=await pool.query('SELECT media_path FROM sorbi.requests WHERE id=$1'+(isAdmin?'':' AND user_id=$2'),params);
+  const key=result.rows[0]?.media_path;
+  if(!key)return res.sendStatus(404);
+  const signed=await supabase.storage.from(mediaBucket).createSignedUrl(key,3600);
+  if(signed.error)throw signed.error;
+  res.set('Cache-Control','no-store').json({url:signed.data.signedUrl});
+}
+app.get('/admin/api/requests/:id/media',requireAdmin,asyncRoute(playMedia));
+app.get('/requests/student/:userId/:id/media',asyncRoute(playMedia));
 app.get('/requests/student/:userId',asyncRoute(async(req,res)=>{
-  const result=await pool.query('SELECT id,question_id,kind,detail,reply FROM sorbi.requests WHERE user_id=$1 ORDER BY id DESC',[req.params.userId]);
+  const result=await pool.query('SELECT id,question_id,kind,detail,reply,media_kind FROM sorbi.requests WHERE user_id=$1 ORDER BY id DESC',[req.params.userId]);
   res.json(result.rows);
 }));
 app.get('/admin/api/requests',requireAdmin,asyncRoute(async(req,res)=>{
   const result=await pool.query(`SELECT r.*,coalesce(nullif(u.display_name,''),r.user_id) AS student,
     q.file AS question_file,q.answer AS original_answer,q.answer_file AS original_image FROM sorbi.requests r
-    LEFT JOIN sorbi.users u USING(user_id) LEFT JOIN sorbi.questions q ON q.id=r.question_id ORDER BY (r.reply='') DESC,r.id DESC`);
+    LEFT JOIN sorbi.users u USING(user_id) LEFT JOIN sorbi.questions q ON q.id=r.question_id ORDER BY (r.reply='' AND r.media_path IS NULL) DESC,r.id DESC`);
   res.json(result.rows);
 }));
 app.post('/admin/api/requests/:id',requireAdmin,asyncRoute(async(req,res)=>{
@@ -1619,6 +1686,7 @@ initializeDatabase()
     await pool.end();
     process.exitCode = 1;
   });
+
 
 
 
