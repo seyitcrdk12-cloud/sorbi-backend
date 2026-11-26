@@ -212,8 +212,8 @@ function teacherMessage(job) {
   return {
     token: job.fcm_token,
     notification: {
-      title: isQuestion ? 'Yeni soru geldi' : isManual ? 'Yeni hak verildi' : testPrefix + 'Ödeme doğrulandı',
-      body: isQuestion
+      title: type==='student_request' ? 'Yeni öğrenci talebi' : isQuestion ? 'Yeni soru geldi' : isManual ? 'Yeni hak verildi' : testPrefix + 'Ödeme doğrulandı',
+      body: type==='student_request' ? data.kind : isQuestion
         ? ({ english: 'İngilizce', math: 'Matematik', biology: 'Biyoloji' }[data.subject] || 'Ders') + ' sorusu çözüm bekliyor.'
         : isManual ? 'Bir öğrenciye 15 soru hakkı manuel eklendi.' : 'Ödeme doğrulandı, öğrenciye 15 soru hakkı otomatik eklendi.',
     },
@@ -437,6 +437,17 @@ ADD COLUMN IF NOT EXISTS feedback TEXT;
       ALTER TABLE sorbi.questions ADD COLUMN IF NOT EXISTS answered_by TEXT;
       CREATE INDEX IF NOT EXISTS sorbi_questions_user_idx ON sorbi.questions(user_id);
       
+      ALTER TABLE sorbi.questions ADD COLUMN IF NOT EXISTS solution_kind TEXT NOT NULL DEFAULT 'Yazılı';
+      CREATE TABLE IF NOT EXISTS sorbi.memberships (
+        user_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, order_id TEXT NOT NULL, purchase_token TEXT NOT NULL, checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        expires TIMESTAMPTZ NOT NULL, active BOOLEAN NOT NULL, used INTEGER NOT NULL DEFAULT 0,
+        lesson_used BOOLEAN NOT NULL DEFAULT FALSE
+      );
+      CREATE TABLE IF NOT EXISTS sorbi.requests (
+        id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, question_id BIGINT REFERENCES sorbi.questions(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL, detail TEXT NOT NULL, reply TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS requests_owner ON sorbi.requests(user_id,id);
       CREATE TABLE IF NOT EXISTS sorbi.play_purchases (
         token_hash TEXT PRIMARY KEY,
         user_id TEXT NOT NULL REFERENCES sorbi.users(user_id),
@@ -551,6 +562,7 @@ function questionJson(row) {
     userId: row.user_id,
     file: row.file,
     creditType: row.credit_type,
+    solutionKind: row.solution_kind,
     status: row.status,
     answer: row.answer,
     answerFile: row.answer_file,
@@ -576,18 +588,21 @@ async function readQuestions(userId) {
 async function getRightsInfo(userId, db = pool) {
   const { rows } = await db.query(
     `SELECT
-       (SELECT COUNT(*) FROM sorbi.questions WHERE user_id = $1) AS used,
+       (SELECT COUNT(*) FROM sorbi.questions WHERE user_id = $1 AND credit_type <> 'monthly') AS used,
        COALESCE((SELECT paid_credits FROM sorbi.users WHERE user_id = $1), 0) AS paid`,
     [userId]
   );
   const freeRemaining = Math.max(0, FREE_QUESTION_LIMIT - Number(rows[0].used));
+  const membership = (await db.query('SELECT * FROM sorbi.memberships WHERE user_id=$1 AND active AND expires>now()', [userId])).rows[0];
+  const monthlyRemaining = membership ? Math.max(0, 30-membership.used) : 0;
   const paidRemaining = Number(rows[0].paid);
   return {
     freeQuestionLimit: FREE_QUESTION_LIMIT,
     freeRemaining,
     paidRemaining,
-    totalRemaining: freeRemaining + paidRemaining,
-    needsPackage: freeRemaining + paidRemaining <= 0,
+    monthlyRemaining, membershipActive: !!membership, lessonAvailable: !!membership && !membership.lesson_used,
+    totalRemaining: freeRemaining + paidRemaining + monthlyRemaining,
+    needsPackage: freeRemaining + paidRemaining + monthlyRemaining <= 0,
   };
 }
 
@@ -701,6 +716,89 @@ async function deliverPlayPurchase(userId, token, purchase) {
     return { alreadyGranted: false, ...await getRightsInfo(userId, db) };
   });
 }
+const MONTHLY = 'sorbi_aylik_30';
+async function reconcileMembership(req,res) {
+  const {userId, purchaseToken} = req.body;
+  if (!billingReady()) return res.status(503).json({error:'BILLING_DISABLED'});
+  if (typeof userId !== 'string' || !userId || userId.length>200 || typeof purchaseToken !== 'string' || purchaseToken.length>4096)
+    return res.status(400).json({error:'INVALID_REQUEST'});
+  const response = await fetch('https://androidpublisher.googleapis.com/androidpublisher/v3/applications/'+PLAY_PACKAGE+'/purchases/subscriptionsv2/tokens/'+encodeURIComponent(purchaseToken), {
+    headers:{Authorization:'Bearer '+await playAuthorization()},signal:AbortSignal.timeout(15000)
+  });
+  if (!response.ok) return res.status(response.status===410 || response.status===404 ? 400 : 503).json({error:response.status===410 || response.status===404 ? 'INVALID_PURCHASE':'PLAY_UNAVAILABLE'});
+  const receipt=await response.json();
+  if (receipt.externalAccountIdentifiers?.obfuscatedExternalAccountId !== playAccountId(userId))
+    return res.status(403).json({error:'PURCHASE_ACCOUNT_MISMATCH'});
+  const item=receipt.lineItems?.find(i=>i.productId===MONTHLY && i.offerDetails?.basePlanId==='aylik');
+  if (!item?.latestSuccessfulOrderId || !item.expiryTime) return res.status(409).json({error:'PAYMENT_NOT_COMPLETED'});
+  const active=['SUBSCRIPTION_STATE_ACTIVE','SUBSCRIPTION_STATE_IN_GRACE_PERIOD','SUBSCRIPTION_STATE_CANCELED'].includes(receipt.subscriptionState) && Date.parse(item.expiryTime)>Date.now();
+  const hash=crypto.createHash('sha256').update(purchaseToken).digest('hex');
+  await pool.query(`INSERT INTO sorbi.memberships AS m(user_id,token_hash,order_id,expires,active,purchase_token)
+    VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(user_id) DO UPDATE SET purchase_token=EXCLUDED.purchase_token, checked_at=now(),
+    used=CASE WHEN m.order_id=EXCLUDED.order_id THEN m.used ELSE 0 END,
+    lesson_used=CASE WHEN m.order_id=EXCLUDED.order_id THEN m.lesson_used ELSE FALSE END,
+    order_id=EXCLUDED.order_id, token_hash=EXCLUDED.token_hash, expires=EXCLUDED.expires, active=EXCLUDED.active
+    WHERE EXCLUDED.expires>=m.expires OR (m.token_hash=EXCLUDED.token_hash AND m.order_id=EXCLUDED.order_id)`,
+    [userId,hash,item.latestSuccessfulOrderId,item.expiryTime,active,purchaseToken]);
+  return res.json({verified:true,...await getRightsInfo(userId)});
+}
+app.post('/billing/monthly/verify',asyncRoute(reconcileMembership));
+async function refreshMembership(userId) {
+  const {rows}=await pool.query("SELECT purchase_token FROM sorbi.memberships WHERE user_id=$1 AND checked_at<now()-interval '5 minutes' AND expires>now()-interval '60 days'",[userId]);
+  if (!rows.length) return;
+  let code=200;
+  const result=await reconcileMembership({body:{userId,purchaseToken:rows[0].purchase_token}},{
+    status(value){code=value;return this;},json(value){return value;}
+  });
+  if(code===200)return;
+  if(['INVALID_PURCHASE','PAYMENT_NOT_COMPLETED','PURCHASE_ACCOUNT_MISMATCH'].includes(result.error)){
+    await pool.query('UPDATE sorbi.memberships SET active=false,checked_at=now() WHERE user_id=$1 AND purchase_token=$2',[userId,rows[0].purchase_token]);
+    return;
+  }
+  throw Object.assign(new Error('Google Play aboneliği doğrulanamadı. Tekrar dene.'),{requestStatus:503});
+}
+
+app.get('/requests/student/:userId',asyncRoute(async(req,res)=>{
+  const result=await pool.query('SELECT id,question_id,kind,detail,reply FROM sorbi.requests WHERE user_id=$1 ORDER BY id DESC',[req.params.userId]);
+  res.json(result.rows);
+}));
+app.get('/admin/api/requests',requireAdmin,asyncRoute(async(req,res)=>{
+  const result=await pool.query(`SELECT r.*,coalesce(nullif(u.display_name,''),r.user_id) AS student,
+    q.file AS question_file,q.answer AS original_answer,q.answer_file AS original_image FROM sorbi.requests r
+    LEFT JOIN sorbi.users u USING(user_id) LEFT JOIN sorbi.questions q ON q.id=r.question_id ORDER BY (r.reply='') DESC,r.id DESC`);
+  res.json(result.rows);
+}));
+app.post('/admin/api/requests/:id',requireAdmin,asyncRoute(async(req,res)=>{
+  const reply=String(req.body.reply||'').trim();
+  if (!reply || reply.length>5000) return res.status(400).json({error:'1–5000 karakterlik cevap yaz.'});
+  const updated=await pool.query('UPDATE sorbi.requests SET reply=$1 WHERE id=$2',[reply,req.params.id]);
+  res.sendStatus(updated.rowCount ? 200 : 404);
+}));
+app.post('/requests/student',asyncRoute(async(req,res)=>{
+  const {userId,kind,questionId,topic,subject,time,detail}=req.body;
+  const valid=x=>typeof x==='string' && x.trim().length>0 && x.length<=2000;
+  if (!valid(userId)) return res.status(400).json({error:'Öğrenci bilgisi eksik.'});
+  if(kind==='Ücretsiz ders') await refreshMembership(userId);
+  await transaction(async db=>{
+    let body=detail, id=null;
+    if (kind==='Canlı ders' || kind==='Ücretsiz ders') {
+      if (![topic,subject,time].every(valid)) throw Object.assign(new Error('Ders, konu ve uygun saat gerekli.'),{requestStatus:400});
+      if (kind==='Ücretsiz ders'){
+        const result=await db.query('UPDATE sorbi.memberships SET lesson_used=TRUE WHERE user_id=$1 AND active AND expires>now() AND NOT lesson_used',[userId]);
+        if (!result.rowCount) throw Object.assign(new Error('Bu dönem için ücretsiz ders hakkı bulunamadı.'),{requestStatus:409});
+      }
+      body=[subject,topic,time,kind==='Ücretsiz ders'?'30 dakika ücretsiz':'450 TL/saat'].join(' · ');
+    } else {
+      if (!['Çözüme soru sor','Sesli açıklama','Video açıklama'].includes(kind) || !/^\d+$/.test(String(questionId)) || (kind==='Çözüme soru sor' && !valid(detail))) throw Object.assign(new Error('Talep bilgileri eksik.'),{requestStatus:400});
+      const q=await db.query("SELECT id FROM sorbi.questions WHERE id=$1 AND user_id=$2 AND status='cevaplandı'",[questionId,userId]);
+      if (!q.rowCount) throw Object.assign(new Error('Çözüm bulunamadı.'),{requestStatus:404});
+      id=questionId; body=valid(detail)?detail:'';
+    }
+    const saved=await db.query('INSERT INTO sorbi.requests(user_id,question_id,kind,detail) VALUES($1,$2,$3,$4) RETURNING id',[userId,id,kind,body]);
+    await queueTeacherPush(db,'request:'+saved.rows[0].id,{type:'student_request',kind,requestId:String(saved.rows[0].id)});
+  });
+  res.sendStatus(201);
+}));
 app.get('/billing/config/:userId', (req, res) => {
   res.set('Cache-Control', 'no-store');
   if (!/^user_[A-Za-z0-9_]{1,120}$/.test(req.params.userId)) return res.status(400).json({error:'INVALID_USER'});
@@ -736,6 +834,7 @@ app.get("/", (req, res) => res.send("SorBi server çalışıyor"));
 app.get(
   "/rights/:userId",
   asyncRoute(async (req, res) => {
+    await refreshMembership(req.params.userId);
     res.json(await getRightsInfo(req.params.userId));
   })
 );
@@ -857,6 +956,7 @@ app.post(
     }
     let result;
     try {
+      await refreshMembership(userId);
       result = await transaction(async client => {
         await client.query(
           "INSERT INTO sorbi.users(user_id) VALUES ($1) ON CONFLICT DO NOTHING",
@@ -870,7 +970,15 @@ app.post(
         const rights = await getRightsInfo(userId, client);
         if (rights.needsPackage) return null;
 
-        const creditType = rights.freeRemaining > 0 ? "free" : "paid";
+        const requestedKind = req.body.solutionKind || 'Yazılı';
+        if (!['Yazılı','Sesli','Video'].includes(requestedKind) || (requestedKind !== 'Yazılı' && !rights.monthlyRemaining)) {
+          throw Object.assign(new Error('Bu çözüm türü için abonelik soru hakkı gerekiyor.'), {requestStatus:409});
+        }
+        const creditType = rights.monthlyRemaining > 0 ? 'monthly' : rights.freeRemaining > 0 ? "free" : "paid";
+        if (creditType === 'monthly') {
+          const updated = await client.query('UPDATE sorbi.memberships SET used=used+1 WHERE user_id=$1 AND used<30 AND active AND expires>now()', [userId]);
+          if (!updated.rowCount) throw Object.assign(new Error('Abonelik hakkını yenileyip tekrar dene.'), {requestStatus:409});
+        }
         if (creditType === "paid") {
           await client.query(
             "UPDATE sorbi.users SET paid_credits = paid_credits - 1, updated_at = NOW() WHERE user_id = $1",
@@ -880,9 +988,9 @@ app.post(
 
         const questionImageUrl = await uploadImageToStorage(req.file, "questions");
         const saved = await client.query(
-          `INSERT INTO sorbi.questions(user_id, file, credit_type, subject)
-           VALUES ($1,$2,$3,$4) RETURNING id`,
-          [userId, questionImageUrl, creditType, subject]
+          `INSERT INTO sorbi.questions(user_id, file, credit_type, subject, solution_kind)
+           VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+          [userId, questionImageUrl, creditType, subject, requestedKind]
         );
 
         await queueTeacherPush(client, 'question:' + saved.rows[0].id, {
@@ -1363,6 +1471,7 @@ app.get("/admin/api/dashboard", requireAdmin, asyncRoute(async (req, res) => {
 }));
 
 app.use((error, req, res, next) => {
+  if (error.requestStatus) return res.status(error.requestStatus).json({error:error.message});
   console.error(
     "İşlem hatası:",
     error.code || error.name || "SERVER_ERROR",
@@ -1510,4 +1619,6 @@ initializeDatabase()
     await pool.end();
     process.exitCode = 1;
   });
+
+
 
